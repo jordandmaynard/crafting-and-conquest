@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Crafting &amp; Conquest</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Alfa+Slab+One&amp;family=Nunito:wght@600;700;800;900&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="ui.css">
+</head>
+<body class="in-menu">
+<canvas id="view"></canvas>
+
+<div id="menu">
+  <div class="shade"></div>
+  <div class="menu-main on-dark">
+    <div class="title">
+      <div class="rod tex-plank"></div>
+      <div class="bn"><div class="trim"></div><h1>CRAFTING<span>&amp;</span>CONQUEST</h1></div>
+    </div>
+    <nav class="modes" aria-label="Game modes">
+      <div class="rod tex-plank"></div>
+      <button type="button" class="bn mode play" data-mode="new" disabled>
+        <span class="ico"><svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#2b1d12" stroke-width="2.4" stroke-linecap="square" aria-hidden="true"><path d="M3 19h18M4 19L3 8l5 4 4-7 4 7 5-4-1 11"/></svg></span>
+        <span class="nm">Play</span><span class="note">New game against up to three kingdoms</span><span class="key">Enter</span>
+      </button>
+      <button type="button" class="bn mode sandbox" data-mode="sandbox" disabled>
+        <span class="ico"><svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#2b1d12" stroke-width="2.4" stroke-linecap="square" aria-hidden="true"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9zM12 12l8-4.5M12 12v9M12 12L4 7.5"/></svg></span>
+        <span class="nm">Sandbox</span><span class="note">Every block free, units at a key press, instant building</span><span class="key">S</span>
+      </button>
+      <button type="button" class="bn mode workshop" data-mode="editor" disabled>
+        <span class="ico"><svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#2b1d12" stroke-width="2.4" stroke-linecap="square" aria-hidden="true"><path d="M4 20V4l16 16zM8 16v-4l4 4z"/></svg></span>
+        <span class="nm">Workshop</span><span class="note">Design buildings for your kingdom</span><span class="key">W</span>
+      </button>
+    </nav>
+    <div class="util">
+      <button type="button" class="btn" data-open="options">Options<span class="key">O</span></button>
+      <button type="button" class="btn" data-open="controls">How to play<span class="key">F1</span></button>
+      <button type="button" class="btn" data-open="credits">Credits<span class="key">C</span></button>
+    </div>
+    <div class="menu-note">Making the world…</div>
+  </div>
+
+  <div class="menu-setup" hidden>
+    <div class="panel setup-main">
+      <div class="setup-head">
+        <button type="button" class="btn" data-setup="back"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#2b1d12" stroke-width="4" stroke-linecap="square" aria-hidden="true"><path d="M15 4l-8 8 8 8"/></svg>Back<span class="key">Esc</span></button>
+        <h2>New game</h2>
+      </div>
+      <section>
+        <h3>Map size</h3>
+        <div class="sizes" role="radiogroup" aria-label="Map size">
+          <label class="btn"><input type="radio" name="map" value="small"><span class="h-disp">Small</span><small>Quick duel · 128²</small></label>
+          <label class="btn"><input type="radio" name="map" value="medium" checked><span class="h-disp">Medium</span><small>Standard · 256²</small></label>
+          <label class="btn"><input type="radio" name="map" value="large"><span class="h-disp">Large</span><small>Long game · 512²</small></label>
+          <label class="btn"><input type="radio" name="map" value="huge"><span class="h-disp">Huge</span><small>Epic · 1024²</small></label>
+        </div>
+      </section>
+      <section>
+        <h3>Who you face</h3>
+        <div class="faces" id="faces"><div class="rod tex-plank"></div></div>
+      </section>
+      <div class="setup-grid">
+        <section>
+          <h3>World options</h3>
+          <div class="slider" title="How high the land rises over the water: ×1 as it comes"><span>Mountains</span><input id="setup-mount" type="range" min="0.25" max="2.5" step="0.05" value="1" aria-label="Mountains"><output id="setup-mount-out">×1.00</output></div>
+          <div class="slider" title="How much of the map is below sea level, under the water"><span>Water</span><input id="setup-water" type="range" min="0" max="90" step="1" value="30" aria-label="Water"><output id="setup-water-out">30%</output></div>
+          <div class="slider" title="How many trees and how much iron and gold: ×1 as it comes"><span>Resources</span><input id="setup-res" type="range" min="0.25" max="2" step="0.05" value="1" aria-label="Resources"><output id="setup-res-out">×1.00</output></div>
+          <span style="font: 900 15px/1.2 var(--body)">Symmetry</span>
+          <div class="syms" role="radiogroup" aria-label="Symmetry">
+            <label class="btn"><input type="radio" name="mirror" value="none" checked><svg width="44" height="30" viewBox="0 0 44 30" aria-hidden="true"><rect x="2" y="2" width="40" height="26" rx="3" fill="#8fbfd9" stroke="#2b1d12" stroke-width="3"/><path d="M12 20h0M33 10h0" stroke="#2b1d12" stroke-width="5" stroke-linecap="square"/></svg><small>Off</small></label>
+            <label class="btn"><input type="radio" name="mirror" value="x"><svg width="44" height="30" viewBox="0 0 44 30" aria-hidden="true"><rect x="2" y="2" width="40" height="26" rx="3" fill="#8fbfd9" stroke="#2b1d12" stroke-width="3"/><path d="M22 3v24" stroke="#2b1d12" stroke-width="2.5" stroke-dasharray="3 3" fill="none"/><path d="M11 15h0M33 15h0" stroke="#2b1d12" stroke-width="5" stroke-linecap="square"/></svg><small>Left-right</small></label>
+            <label class="btn"><input type="radio" name="mirror" value="z"><svg width="44" height="30" viewBox="0 0 44 30" aria-hidden="true"><rect x="2" y="2" width="40" height="26" rx="3" fill="#8fbfd9" stroke="#2b1d12" stroke-width="3"/><path d="M3 15h38" stroke="#2b1d12" stroke-width="2.5" stroke-dasharray="3 3" fill="none"/><path d="M22 8h0M22 22h0" stroke="#2b1d12" stroke-width="5" stroke-linecap="square"/></svg><small>Top-bottom</small></label>
+            <label class="btn"><input type="radio" name="mirror" value="both"><svg width="44" height="30" viewBox="0 0 44 30" aria-hidden="true"><rect x="2" y="2" width="40" height="26" rx="3" fill="#8fbfd9" stroke="#2b1d12" stroke-width="3"/><path d="M22 3v24M3 15h38" stroke="#2b1d12" stroke-width="2.5" stroke-dasharray="3 3" fill="none"/><path d="M11 8h0M33 8h0M11 22h0M33 22h0" stroke="#2b1d12" stroke-width="5" stroke-linecap="square"/></svg><small>Quarters</small></label>
+          </div>
+        </section>
+        <section class="rules">
+          <h3 style="margin-bottom: 2px">Rules</h3>
+          <label class="rule"><input type="checkbox" id="setup-bridge" checked><span class="box"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#2b1d12" stroke-width="4.5" stroke-linecap="square" aria-hidden="true"><path d="M4 12l5 5L20 6"/></svg></span><span><b>Land bridge</b><small>Always a way on foot between starts</small></span></label>
+          <label class="rule"><input type="checkbox" id="setup-fog" checked><span class="box"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#2b1d12" stroke-width="4.5" stroke-linecap="square" aria-hidden="true"><path d="M4 12l5 5L20 6"/></svg></span><span><b>Fog of war</b><small>See only near your own</small></span></label>
+          <label class="rule"><input type="checkbox" id="seed-random"><span class="box"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#2b1d12" stroke-width="4.5" stroke-linecap="square" aria-hidden="true"><path d="M4 12l5 5L20 6"/></svg></span><span><b>New seed every game</b><small>Start rolls a new world each time</small></span></label>
+          <div style="display: flex; flex-direction: column; gap: 6px; margin-top: 6px">
+            <label for="seed" style="font: 900 16px/1.2 var(--body)">Seed</label>
+            <div class="seed"><input id="seed" type="text" maxlength="40" aria-describedby="seed-note"><button type="button" class="btn" id="seed-roll" aria-label="Roll a random seed"><svg width="24" height="24" viewBox="0 0 24 24" fill="#fff8e6" stroke="#2b1d12" stroke-width="2.5" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="8" cy="8" r="1.6" fill="#2b1d12"/><circle cx="12" cy="12" r="1.6" fill="#2b1d12"/><circle cx="16" cy="16" r="1.6" fill="#2b1d12"/></svg></button></div>
+            <span id="seed-note" style="font: 700 13px/1.3 var(--body); color: var(--ink-2)">A number or any text. The same seed makes the same world.</span>
+          </div>
+        </section>
+      </div>
+    </div>
+    <aside class="setup-side">
+      <div class="panel summary"><span class="h-disp">Your world</span><div class="teams" id="setup-teams"></div><p id="setup-summary"></p></div>
+      <button type="button" class="btn again" id="setup-again"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#2b1d12" stroke-width="3" stroke-linecap="square" aria-hidden="true"><path d="M4 12a8 8 0 1 0 3-6.2M4 4v5h5"/></svg>Same as last game</button>
+      <div class="start-wrap">
+        <div class="rod tex-plank"></div>
+        <button type="button" class="bn start" data-setup="start"><span class="h-disp">Start game</span><span class="key">Enter</span></button>
+      </div>
+    </aside>
+  </div>
+  <div class="version">Banner Hall UI</div>
+</div>
+
+<div id="hud">
+  <div id="topleft" class="stack">
+    <section id="crystal" class="panel calm" aria-label="Power crystals" hidden></section>
+    <section id="events" aria-label="Events" aria-live="polite"></section>
+  </div>
+  <div id="botright" class="stack">
+    <section id="info" class="panel" aria-label="Information" hidden></section>
+    <section id="minimap" class="panel" aria-label="Minimap">
+      <div class="mm-map"><canvas></canvas></div>
+      <div class="mm-ctl">
+        <button type="button" class="btn mm-collapse" data-tip="Collapse the minimap|M|Click again, or press M, to open it." aria-label="Collapse the minimap (M)"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#2b1d12" stroke-width="4" stroke-linecap="square" aria-hidden="true"><path d="M5 9l7 7 7-7"/></svg><span class="key">M</span></button>
+        <button type="button" class="btn" data-zoom="out" aria-label="Zoom the minimap out" data-tip="Zoom out||The wheel over the map zooms too."><svg width="14" height="14" viewBox="0 0 24 24" stroke="#2b1d12" stroke-width="5" stroke-linecap="square" aria-hidden="true"><path d="M4 12h16"/></svg></button>
+        <button type="button" class="btn" data-zoom="in" aria-label="Zoom the minimap in" data-tip="Zoom in||The wheel over the map zooms too. Middle drag pans it."><svg width="14" height="14" viewBox="0 0 24 24" stroke="#2b1d12" stroke-width="5" stroke-linecap="square" aria-hidden="true"><path d="M4 12h16M12 4v16"/></svg></button>
+      </div>
+      <div class="mm-row">
+        <button type="button" class="btn idle new-only" id="btn-idle"><span class="ico"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#2b1d12" stroke-width="3" stroke-linecap="square" aria-hidden="true"><path d="M7 9h10v5H7zM9 14v6M15 14v6M5 9h14M9 5h6v4H9z"/></svg></span><span class="txt">0 idle</span><span class="key"><span class="dot"></span></span></button>
+        <button type="button" class="btn" id="btn-controls" aria-label="Controls (F1)" data-tip="Controls|F1|Every key, and how things work."><span class="h-disp" style="font-size: 19px">?</span><span class="key">F1</span></button>
+        <button type="button" class="btn" id="btn-pause" aria-label="Pause menu (Esc)" data-tip="Pause menu|Esc|Options, controls, and the main menu."><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#2b1d12" stroke-width="3.5" stroke-linecap="square" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16"/></svg><span class="key">Esc</span></button>
+      </div>
+    </section>
+  </div>
+  <div id="dock-wrap">
+    <div id="modebar" hidden></div>
+    <div id="dock-row">
+      <div id="ribbon" class="panel" aria-label="Resources"></div>
+      <section id="dock" class="panel" aria-label="Selection and Craft"></section>
+    </div>
+  </div>
+</div>
+
+<div id="strength" aria-label="Army strength"></div>
+<section id="tools" class="panel" aria-label="Sandbox tools">
+  <h3 class="sandbox-only">Shape the land</h3>
+  <div class="row sandbox-only">
+    <button type="button" class="btn" data-tool="raise" data-tip="Raise|F3|Click to mark a cube for villagers to fill in. Drag a rectangle, then set its height and click, for a box of the block picked on the bar at the top.">Raise<span class="key">F3</span></button>
+    <button type="button" class="btn" data-tool="lower" data-tip="Lower|F4|Click to mark a cube for villagers to dig out. Drag a rectangle, then set its height and click, for a trench, pit or tunnel.">Lower<span class="key">F4</span></button>
+    <button type="button" class="btn" data-tool="flatten" data-tip="Flatten|F5|Drag a box for idle villagers to level. The wheel sets its height. Del cancels the one under the cursor.">Flatten<span class="key">F5</span></button>
+  </div>
+  <div class="row sandbox-only"><span class="hint">Size</span><input id="radius" type="range" min="1" max="24" step="1" value="1" aria-label="Brush size"><span id="radiusLabel" class="hint">1</span><span class="key">[</span><span class="key">]</span></div>
+  <div class="row sandbox-only">
+    <button type="button" class="btn" id="btn-insta" aria-pressed="false" data-tip="Insta-build|I|Edits happen at once, instead of villagers doing them.">Insta-build<span class="key">I</span></button>
+    <button type="button" class="btn no-editor" id="btn-fog" aria-pressed="false" data-tip="Fog of war|O|Never seen isn't drawn; seen before shows as it was last seen.">Fog<span class="key">O</span></button>
+  </div>
+  <div class="row sandbox-only no-editor"><span class="hint">Game speed</span><span class="key">−</span><span class="key">+</span><span class="hint" id="speed-label">×1.0</span></div>
+  <h3 class="sandbox-only no-editor">Units at the cursor</h3>
+  <div class="spawn sandbox-only no-editor" id="spawn"></div>
+  <span class="hint sandbox-only no-editor"><span class="key">N</span> adds the one picked where the cursor is; with <span class="key">Shift</span>, a red one.</span>
+  <h3 class="editor-only">Workshop</h3>
+  <div class="row editor-only" id="team-look" title="Show everything built in one team's colours (T > Ground sets them), or plain textures; what's built from now on too"><button type="button" class="btn" data-team="none">Plain</button><button type="button" class="btn is-on" data-team="blue">Blue</button><button type="button" class="btn" data-team="red">Red</button><button type="button" class="btn" data-team="yellow">Yellow</button><button type="button" class="btn" data-team="purple">Purple</button></div>
+  <div class="row editor-only"><button id="btn-export" type="button" class="btn" title="Copy every saved design as text (to paste to Claude, to make them part of the game)">Copy designs</button></div>
+  <div class="row editor-only" id="design-export" hidden><textarea readonly aria-label="Saved designs as text"></textarea></div>
+</section>
+
+<div id="pause" class="overlay" hidden>
+  <div class="panel" role="dialog" aria-label="Paused">
+    <div class="hdr-row"><h2>Paused</h2></div>
+    <button type="button" class="btn big" data-pause="resume">Resume<span class="key">Esc</span></button>
+    <button type="button" class="btn big" data-open="controls">Controls<span class="key">F1</span></button>
+    <button type="button" class="btn big" data-open="options">Options<span class="key">O</span></button>
+    <button type="button" class="btn big" data-pause="menu">Main menu<span class="key">Q</span></button>
+    <span style="font: 800 13px/1.3 var(--body); color: var(--ink-2)">The main menu starts this world over.</span>
+  </div>
+</div>
+<div id="controls" class="overlay" hidden>
+  <div class="panel" role="dialog" aria-label="Controls">
+    <div class="hdr-row"><h2>Controls</h2><button type="button" class="btn x" data-close>Close<span class="key">Esc</span></button></div>
+    <div class="cols" id="controls-keys"></div>
+    <div class="cols" id="controls-how"></div>
+  </div>
+</div>
+<div id="options" class="overlay" hidden>
+  <div class="panel" role="dialog" aria-label="Options">
+    <div class="hdr-row"><h2>Options</h2><button type="button" class="btn x" data-close>Close<span class="key">Esc</span></button></div>
+    <label class="opt">Sound<input type="range" id="opt-volume" min="0" max="1" step="0.05" aria-label="Sound volume"><small>Everything's volume. T &gt; Sound has each sound's own.</small></label>
+    <label class="opt">Screen edge moves the camera<input type="checkbox" id="opt-edge"><small>Push the mouse to the edge of the screen to move the camera.</small></label>
+    <label class="opt">Blood<input type="checkbox" id="opt-blood"><small>Red splashes when villagers are hurt.</small></label>
+    <div class="opt">HDR output<button type="button" class="btn" id="btn-hdr" style="height: 38px; padding: 0 12px; border-width: 3px; font: 900 14px var(--body)"><b>Off</b></button><small></small></div>
+  </div>
+</div>
+<div id="credits" class="overlay" hidden>
+  <div class="panel" role="dialog" aria-label="Credits" style="width: 460px">
+    <div class="hdr-row"><h2>Credits</h2><button type="button" class="btn x" data-close>Close<span class="key">Esc</span></button></div>
+    <p style="margin: 0; font: 700 15px/1.5 var(--body)">Made by Jordan Maynard, with Claude. Pure JavaScript and WebGPU, no build step.</p>
+    <p style="margin: 0; font: 700 15px/1.5 var(--body)">Type: Alfa Slab One (JM Solé) and Nunito (Vernon Adams), SIL Open Font License. Ocean waves after the web-ocean project (see LICENSES).</p>
+  </div>
+</div>
+
+<div id="toast" role="status" hidden></div>
+<div id="possess" hidden></div>
+<div id="select-box" hidden></div>
+<div id="stats" class="dev"></div>
+<div id="dev-btns" class="dev">
+  <button id="btn-gpu" type="button" class="btn" title="Profiler: fps, GPU, time per render pass (G)">GPU<span class="key">G</span></button>
+  <button id="btn-tuning" type="button" class="btn" title="Time of day, light, sky, water, combat and the rest (T)">Tuning<span class="key">T</span></button>
+</div>
+<div id="gpu-panel" class="prof" hidden></div>
+<div id="tuning" class="tune" hidden></div>
+<div id="error"></div>
+<script type="module" src="src/main.js"></script>
+</body>
+</html>
