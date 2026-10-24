@@ -24,6 +24,8 @@ export const WORK_TUNING = {
   reachUp: 2,        // voxels above its feet it can reach
   reachDown: 3,      // and below
   retryDelay: 1,     // seconds before a column that couldn't be reached is tried again
+  claimMs: 6,        // milliseconds one search for a way to work may take (longer: as if there were none)
+  retryMax: 30,      // and at most this many, doubling each time no worker could find a way to it
   claimsPerFrame: 4, // columns a villager may try in one frame
   idleRetry: 0.5,    // seconds an idle villager waits after finding no column it can work on
   pathsPerFrame: 1,  // path searches all workers together may make in one frame (an unreachable spot is costly)
@@ -62,6 +64,8 @@ export function carryCap(block) {
 const pileFor = (block) => block === BLOCK.PLANK ? 'lumberjack' : block === WHEAT ? 'farmer' : 'miner';
 
 const [X, Y, Z] = SIZE;
+// A cell's number, for Sets and Maps of cells (see region).
+const cellKey = (x, y, z) => x + X * (z + Z * y);
 
 export class FlattenJob {
   // Columns [x0, x1) × [z0, z1), levelled so the ground's top is at height `level`.
@@ -391,17 +395,27 @@ export function specFor(terrain, t, job = t.job) {
   return 'builder';
 }
 
-// The open flatten jobs, and the villagers working on them: picks columns for idle villagers, walks them there and
-// carries out the work. Lives alongside Units, which owns the villagers.
+// A team's open jobs, and its workers working on them: picks columns for its idle workers, walks them there and
+// carries out the work. Each team has its own (Units.crews), with its own orders, inventory and piles, so one team's
+// workers never take another's orders or spend its blocks. Lives alongside Units, which owns the villagers.
 export class Workers {
-  constructor(units) {
+  constructor(units, team = 'blue') {
     this.units = units;
+    this.team = team;
     this.jobs = [];
     this.clock = 0;
     this.inventory = null; // a new game's (see inventory.js); sandbox has none, and every block is free
     this.seeking = null;   // { job, seen(x, z) }: where Lumberjacks and Miners mark what they find (see seek)
-    this.depots = null;    // (block) => [{ lo, hi }]: where workers take what they carry (see deliver; a new game)
+    this.depots = null;    // (block) => [{ lo, hi }]: where this team's workers take what they carry (deliver; a new game)
     this.piles = [];       // { x, y, z, block, n }: what's left on the ground for a later trip (see take)
+    this.paths = null;     // { deadline, n }: the path searches every team's workers share this frame (see Units.update)
+  }
+  // Whether this frame's path searches are used up (one more is allowed: see paths), else counts one.
+  pathBudget() {
+    const P = this.paths;
+    if (P.n >= WORK_TUNING.pathsPerFrame || (P.n > 0 && performance.now() > P.deadline)) return false;
+    P.n++;
+    return true;
   }
 
   // Whether the inventory has a block for task t (when it places one) that nobody else is already placing.
@@ -433,19 +447,19 @@ export class Workers {
     for (const j of this.jobs) j.owners?.delete(u.id);
   }
 
-  // Free to take on work: one of the player's (blue) workers, not on a column and not walking somewhere it was sent.
+  // Free to take on work: one of this team's workers, not on a column and not walking somewhere it was sent.
   idle(u) {
-    return u.team === 'blue' && u.kind === 'worker' && !u.dying && !u.task && !u.ladderBuild && !(u.goal && (u.path.length || u.repath > 0)) && this.clock >= (u.nextClaim ?? 0);
+    return u.team === this.team && u.kind === 'worker' && !u.dying && !u.task && !u.ladderBuild && !(u.goal && (u.path.length || u.repath > 0)) && this.clock >= (u.nextClaim ?? 0);
   }
 
   // Per frame, before the units move: give idle villagers a column, and do the work of those that have arrived.
-  update(dt) {
+  // paths: this frame's path searches, shared with the other teams' workers (see Units.update).
+  update(dt, paths = { deadline: performance.now() + WORK_TUNING.pathMs, n: 0 }) {
     this.clock += dt;
-    this.pathDeadline = performance.now() + WORK_TUNING.pathMs;
-    this.pathsThisFrame = 0;
-    // Take the villagers in turn, starting one further along each frame, so when there's only time for some of them
-    // to look for a path, it isn't always the same ones.
-    const list = this.units.list, n = list.length;
+    this.paths = paths;
+    // Take the team's villagers in turn, starting one further along each frame, so when there's only time for some of
+    // them to look for a path, it isn't always the same ones.
+    const list = this.units.list.filter((u) => u.team === this.team), n = list.length;
     this.turn = ((this.turn ?? 0) + 1) % Math.max(1, n);
     for (let j = 0; j < n; j++) {
       const u = list[(this.turn + j) % n];
@@ -583,19 +597,24 @@ export class Workers {
       let path = [];
       if (stand !== u.cell) {
         // Out of time for path searches this frame: try again next frame.
-        if (this.pathsThisFrame >= WORK_TUNING.pathsPerFrame || (this.pathsThisFrame > 0 && performance.now() > this.pathDeadline)) return;
-        this.pathsThisFrame++;
+        if (!this.pathBudget()) return;
         const near = u.cell[0] >= job.x0 - 4 && u.cell[0] < job.x1 + 4 && u.cell[2] >= job.z0 - 4 && u.cell[2] < job.z1 + 4;
-        path = units.findPath(u.cell, stand, near ? WORK_TUNING.pathSearch : undefined, true, u.team);
+        path = units.findPath(u.cell, stand, near ? WORK_TUNING.pathSearch : undefined, true, u.team, performance.now() + WORK_TUNING.claimMs);
         const end = path[path.length - 1];
         if (!end || end[0] !== stand[0] || end[1] !== stand[1] || end[2] !== stand[2]) {
-          // No way to get right beside it: next time, from wherever's within reach.
+          // No way to get right beside it: next time, from wherever's within reach. No way at all: tried again later,
+          // twice as long each time (a search that finds no way is the longest there is), up to retryMax seconds.
           if (beside) (job.far ??= new Set()).add(k);
-          else job.skipUntil.set(k, this.clock + WORK_TUNING.retryDelay);
+          else {
+            const misses = (job.misses ??= new Map()), n = (misses.get(k) ?? 0) + 1;
+            misses.set(k, n);
+            job.skipUntil.set(k, this.clock + Math.min(WORK_TUNING.retryMax, WORK_TUNING.retryDelay * 2 ** (n - 1)));
+          }
           continue;
         }
       }
       job.claimed.set(k, u.id);
+      job.misses?.delete(k);
       t.job = job;
       u.task = t;
       u.path = path;
@@ -615,25 +634,36 @@ export class Workers {
     if (!lad || this.clock < (u.nextEscape ?? 0)) return false;
     u.nextEscape = this.clock + L.every;
     const goals = u.stuckGoal ? [u.stuckGoal] : this.homeCells(u, u.carry?.block ?? BLOCK.BRICK);
-    const N = Math.max(4, Math.round(L.trapped)), BIG = 4000;
-    const region = this.region(u.cell, BIG, new Set(goals.map((g) => g.join())));
-    // Not stuck: it can get there (or, with nowhere it has to be, it isn't hemmed in).
+    const N = Math.max(4, Math.round(L.trapped)), BIG = 4000, ms = () => performance.now() + WORK_TUNING.claimMs;
+    const pit = this.flood(u.cell, BIG, new Set(goals.map((g) => cellKey(...g)))), whole = this.grow(pit, ms()), region = pit.seen;
+    // Not stuck: it can get there (or, with nowhere it has to be, it isn't hemmed in; or that takes too long to tell:
+    // it's walking about plenty of ground).
     if (goals.length) {
       if (region.hit) return false;
-      if (region.size >= BIG) {
-        const g = goals[0], end = units.findPath(u.cell, g, undefined, true, u.team).at(-1) ?? u.cell;
-        if (end.join() === g.join()) return false;
+      if (region.size >= BIG || !whole) {
+        const g = goals[0], end = units.findPath(u.cell, g, undefined, true, u.team, ms()).at(-1) ?? u.cell;
+        if (end.join() === g.join() || units.searchTimedOut) return false;
       }
-    } else if (region.size >= N) return false;
-    if (lad.building.some((b) => region.has(`${b.x},${b.y0},${b.z}`))) return false; // (someone's on it)
+    } else if (region.size >= N || !whole) return false;
+    if (lad.building.some((b) => region.has(cellKey(b.x, b.y0, b.z)))) return false; // (someone's on it)
     // Where it can get home from: the cells reachable from there (near enough, as it can walk back the way it came,
-    // bar the drops), checked properly by a path before it starts.
-    const hk = goals[0]?.join(), H = this.homeRegion;
-    const home = !goals.length ? null : H?.key === hk && this.clock < H.until ? H.cells
-      : (this.homeRegion = { key: hk, until: this.clock + 5, cells: this.region(goals[0], 30000) }).cells;
+    // bar the drops), checked properly by a path before it starts. Flooded a bit at a time (it looks again soon), and
+    // kept a while.
+    let home = null;
+    if (goals.length) {
+      const hk = goals[0].join(), homes = (this.homeRegions ??= new Map());
+      let H = homes.get(hk);
+      if (!H || this.clock >= H.until) homes.set(hk, (H = { until: Infinity, f: this.flood(goals[0], 30000) }));
+      if (!H.f.done) {
+        if (!this.grow(H.f, ms())) { u.nextEscape = this.clock + 0.3; return false; }
+        H.until = this.clock + 10;
+        for (const [k, h] of homes) if (this.clock >= h.until) homes.delete(k);
+      }
+      home = H.f.seen;
+    }
     const tried = new Map();
     const good = (c) => {
-      const k = c.join();
+      const k = cellKey(...c);
       if (region.has(k)) return false;
       if (home) return home.has(k);
       if (!tried.has(k)) tried.set(k, this.region(c, N).size >= N);
@@ -658,8 +688,8 @@ export class Workers {
     spots.sort((a, b) => a.cost - b.cost);
     for (const s of spots.slice(0, 3)) {
       if (home) { // (there or as good as: next to it)
-        const g = goals[0], e = units.findPath(s.exit, g, 20000, true, u.team).at(-1) ?? s.exit;
-        if (Math.max(Math.abs(e[0] - g[0]), Math.abs(e[2] - g[2])) > 1 || Math.abs(e[1] - g[1]) > 2) continue;
+        const g = goals[0], e = units.findPath(s.exit, g, 20000, true, u.team, ms()).at(-1) ?? s.exit;
+        if (units.searchTimedOut || Math.max(Math.abs(e[0] - g[0]), Math.abs(e[2] - g[2])) > 1 || Math.abs(e[1] - g[1]) > 2) continue;
       }
       const foot = [s.x, s.y, s.z];
       const path = foot.join() === u.cell.join() ? [] : units.findPath(u.cell, foot, 4000, true, u.team);
@@ -695,21 +725,35 @@ export class Workers {
     return cells;
   }
 
-  // The cells a worker in `cell` can get to (climbing ladders), up to n: key "x,y,z" -> [x, y, z]. Stops early (with
-  // .hit set) on reaching one of the keys in `stop`.
+  // The cells a worker in `cell` can get to (climbing ladders), up to n: cellKey -> [x, y, z]. Stops early (with .hit
+  // set) on reaching one of the keys in `stop`.
   region(cell, n, stop = null) {
-    const units = this.units, seen = new Map([[cell.join(), cell]]), queue = [cell];
-    if (stop?.has(cell.join())) { seen.hit = true; return seen; }
-    for (let q = 0; q < queue.length && seen.size < n; q++) {
-      for (const [x, y, z] of units.neighbours(...queue[q], true)) {
-        const c = [x, y, z], k = c.join();
+    const f = this.flood(cell, n, stop);
+    this.grow(f);
+    return f.seen;
+  }
+  // The same a bit at a time: flood() starts one, grow(f, deadline) carries it on till it's done (true) or it's out of
+  // time (false; call again to go on). Its cells are in f.seen.
+  flood(cell, n, stop = null) {
+    const k0 = cellKey(...cell), seen = new Map([[k0, cell]]);
+    if (stop?.has(k0)) seen.hit = true;
+    return { seen, queue: [cell], q: 0, n, stop, done: !!seen.hit };
+  }
+  grow(f, deadline = Infinity) {
+    const units = this.units, out = units.steps, { seen, queue, stop } = f;
+    for (; !f.done && f.q < queue.length && seen.size < f.n; f.q++) {
+      if ((f.q & 63) === 0 && performance.now() > deadline) return false;
+      const m = units.expand(...queue[f.q], true);
+      for (let i = 0; i < m; i++) {
+        const x = out[i * 4], y = out[i * 4 + 1], z = out[i * 4 + 2], k = cellKey(x, y, z);
         if (seen.has(k)) continue;
+        const c = [x, y, z];
         seen.set(k, c);
         queue.push(c);
-        if (stop?.has(k)) { seen.hit = true; return seen; }
+        if (stop?.has(k)) { seen.hit = true; return (f.done = true); }
       }
     }
-    return seen;
+    return (f.done = true);
   }
 
   // Per frame, a worker building a ladder (u.ladderBuild): it walks to its foot, fixes the rungs it can reach (up to
@@ -723,7 +767,7 @@ export class Workers {
         this.endLadder(u);
         // The others idle down there with it (and not put there) come up too.
         for (const o of units.list) {
-          if (o === u || !this.idle(o) || o.sentHere || o.path.length || !b.pit.has(o.cell.join())) continue;
+          if (o === u || !this.idle(o) || o.sentHere || o.path.length || !b.pit.has(cellKey(...o.cell))) continue;
           const path = units.findPath(o.cell, b.exit, 2000, true, o.team);
           if (path.length) { o.path = path; o.goal = path.at(-1); }
         }
@@ -1141,9 +1185,9 @@ export class Workers {
     const d = (c) => Math.hypot(c[0] + 0.5 - u.pos[0], c[1] - u.pos[1], c[2] + 0.5 - u.pos[2]);
     cells.sort((a, b) => d(a) - d(b));
     if (cells.some((c) => c[0] === u.cell[0] && c[1] === u.cell[1] && c[2] === u.cell[2])) return [];
-    if (this.pathsThisFrame >= WORK_TUNING.pathsPerFrame || (this.pathsThisFrame > 0 && performance.now() > this.pathDeadline)) return null;
-    for (const c of cells.slice(0, 3)) {
-      this.pathsThisFrame++;
+    if (!this.pathBudget()) return null;
+    for (const [i, c] of cells.slice(0, 3).entries()) {
+      if (i) this.paths.n++;
       const path = this.units.findPath(u.cell, c, undefined, true, u.team), end = path[path.length - 1];
       if (end && end[0] === c[0] && end[1] === c[1] && end[2] === c[2]) {
         u.goal = c;
@@ -1251,7 +1295,7 @@ export class Workers {
         const i = t.index(now.x, now.y, now.z), want = now.dig ? BLOCK.AIR : built(now.place ?? BLOCK.GROUND);
         if (now.y < 1 || v[i] === want || v[i] === BLOCK.OBSIDIAN) break;
         v[i] = want;
-        if (!now.dig) t.own(now.x, now.z, 'blue'); // (insta-build is the player's)
+        if (!now.dig) t.own(now.x, now.z, this.team); // (insta-build's done for the team that ordered it)
         grow([now.x, now.y, now.z], [now.x + 1, now.y + 1, now.z + 1]);
       }
     }

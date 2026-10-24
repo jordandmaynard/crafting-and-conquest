@@ -8,7 +8,7 @@ import { createTerrainTextures, loadTerrainImages, NORMAL_FILES } from './textur
 import { Camera, CAMERA_TUNING, POSSESS_TUNING } from './camera.js';
 import { clamp } from './math.js';
 import { GpuProfiler } from './profiler.js';
-import { BANNER_TUNING, CARRY_LOOK, Units, TEAMS, TORCH_TUNING, COMBAT_TUNING, UNIT_TUNING, HIT_TUNING, EYE_TUNING, ANIM_TUNING, LOOK_TUNING, HAIRSTYLE_COUNT, SKIN_TONES, HAIR_COLOURS } from './units.js';
+import { BANNER_TUNING, CARRY_LOOK, POSE_TUNING, Units, TEAMS, TORCH_TUNING, COMBAT_TUNING, UNIT_TUNING, HIT_TUNING, EYE_TUNING, ANIM_TUNING, LOOK_TUNING, HAIRSTYLE_COUNT, SKIN_TONES, HAIR_COLOURS } from './units.js';
 import { RAGDOLL_TUNING } from './ragdoll.js';
 import { UnitRenderer, SELECT_TUNING, GHOST_TUNING } from './units-render.js';
 import { Grass, GRASS_TUNING } from './grass.js';
@@ -23,6 +23,8 @@ import { Sky, SKY_TUNING, linearColor } from './sky.js';
 import { createTuningPanel } from './tuning.js';
 import { plantTrees, plantStartForest, LeafDecay, findTrunk, trunkLogs, forestOf, TREE_TUNING } from './trees.js';
 import { BUILDINGS, BUILDING_ACTIONS, BUILDING_SIGHT, LOOKOUT_TUNING, PRODUCTION_TUNING, POP_TUNING, TRAINING_COST, trainingCost, BUILD_EXTRA, buildExtra, BUILT_IN_DESIGNS, BuildJob, canPlace, canExit, planGhosts, facingToward, captureDesign, designPlan, placeKeep, planBox } from './buildings.js';
+import { Commands } from './commands.js';
+import { Cpu, CPU_TUNING } from './cpu.js';
 import { Torches } from './torches.js';
 import { Banners, BANNER_LOOK } from './banners.js';
 import { Walls, WALL_TUNING, wallBlock } from './walls.js';
@@ -152,26 +154,41 @@ const seed = seedNumber(seedText);
 // in its address): the map's size (read by terrain.js for SIZE), how many opponents, and whether the map's mirrored
 // across x, z (the screen's Y), both, or none; how high the land rises (mount, times as it comes), how much of the
 // map is under the water (water, %), how many trees and how much iron and gold (res, times as it comes) and whether
-// land bridges join the starts (bridge). The game then starts
+// land bridges join the starts (bridge), the player's colour (you), whether the player plays it or the computer does
+// while they watch (self: human, or a level), and how each opponent plays (cpu: a level for each, in order, joined
+// with dots; one for all of them). The game then starts
 // straight away. (parseSetup reads the same from any such text: the New game screen shows the last one started,
 // kept in localStorage as SETUP_KEY.)
 const SETUP_KEY = 'god-game-setup';
+// The teams' colours, in their order (the player takes one; the opponents the rest, in this order), and the levels a
+// computer opponent plays at (off: it stands idle).
+const COLOURS = ['blue', 'red', 'yellow', 'purple'];
+const CPU_LEVEL_NAMES = ['off', 'easy', 'normal', 'hard'];
+const opponentsOf = (you) => COLOURS.filter((t) => t !== you);
 function parseSetup(text) {
   const get = (k) => new RegExp(`(?:^#|&)${k}=([^&]*)`).exec(text)?.[1];
-  const opp = get('opp');
+  const opp = get('opp'), levels = (get('cpu') ?? '').split('.');
+  const self = ['human', 'easy', 'normal', 'hard'].includes(get('self')) ? get('self') : 'human';
   return {
     start: get('new') === '1',
     map: get('map') ?? 'medium',
-    opponents: opp === undefined ? 1 : Math.max(0, Math.min(3, Math.round(+opp) || 0)),
+    // (at least one when the computer plays the player's side too: a game of one does nothing)
+    opponents: opp === undefined ? 1 : Math.max(self === 'human' ? 0 : 1, Math.min(3, Math.round(+opp) || 0)),
+    self,
     mirror: ['x', 'z', 'both'].includes(get('mirror')) ? get('mirror') : 'none',
     fog: get('fog') !== '0', // fog of war (on unless #fog=0)
     mountains: Math.max(0.25, Math.min(2.5, +(get('mount') ?? 1) || 1)),
     water: Math.max(0, Math.min(90, +(get('water') ?? 30) || 0)),
     resources: Math.max(0.25, Math.min(2, +(get('res') ?? 1) || 1)),
     bridge: get('bridge') !== '0', // land bridges (on unless #bridge=0)
+    you: COLOURS.includes(get('you')) ? get('you') : 'blue',
+    cpu: [0, 1, 2].map((i) => levels[Math.min(i, levels.length - 1)]).map((l) => (CPU_LEVEL_NAMES.includes(l) ? l : 'normal')), // how each opponent plays (cpu.js; off: idle)
   };
 }
 const setup = parseSetup(location.hash);
+// A new game the computer plays every side of, the player watching (through the eyes of a side: the first, or the
+// next with F9); they give no orders.
+const watching = setup.start && setup.self !== 'human';
 
 const t0 = performance.now();
 const terrain = new Terrain();
@@ -188,15 +205,21 @@ const besideBridge = (x, z) => {
 };
 plantTrees(terrain, seed, (x, z) => (sym !== 'none' && Terrain.nearSeam(sym, x, z)) || besideBridge(x, z), setup.start ? setup.resources : 1);
 if (sym !== 'none') terrain.mirror(sym);
-// A new game's opponents' teams, in order, each its own side (they fight each other too).
-const OPPONENTS = ['red', 'yellow', 'purple'];
+// A new game's opponents' teams, in order, each its own side (they fight each other too): the colours the player
+// didn't take.
+const OPPONENTS = opponentsOf(setup.start ? setup.you : 'blue');
+// The teams in this game: a new game's (the player's colour and its opponents, each with its own Keep, crystal,
+// workers and inventory), or the sandbox's blue. The person at this screen plays units.player (the first, or another
+// with the test key F9) and the others are their rivals.
+const GAME_TEAMS = setup.start ? [setup.you, ...OPPONENTS.slice(0, setup.opponents)] : ['blue'];
+const rivals = () => GAME_TEAMS.filter((t) => t !== units.player);
 // A new game's starts (see newGameStarts), and a Keep at each, its door towards the middle of the map (see
 // buildings.js placeKeep; its power crystal comes with the game, see startGame). keeps: team -> its Keep's plan.
 const newStarts = setup.start ? newGameStarts(setup.opponents, setup.mirror) : null;
 const keeps = new Map();
 if (newStarts) {
-  [newStarts.blue, ...newStarts.opponents].forEach(([x, z], i) => {
-    const team = i ? OPPONENTS[i - 1] : 'blue', plan = placeKeep(terrain, x, z, facingToward(x, z, [SIZE[0] / 2, 0, SIZE[2] / 2]));
+  [newStarts.you, ...newStarts.opponents].forEach(([x, z], i) => {
+    const team = GAME_TEAMS[i], plan = placeKeep(terrain, x, z, facingToward(x, z, [SIZE[0] / 2, 0, SIZE[2] / 2]));
     keeps.set(team, plan);
     for (const [bx, , bz] of plan.blocks) terrain.own(bx, bz, team); // (its team's colours)
     placeStartOre(terrain, seed, x, z, besideBridge); // (stone and iron near it, if it hasn't them)
@@ -373,10 +396,18 @@ function eliminate(team, at = null) {
   if (at) collapse.start(team, at, { keep: keeps.get(team), walls, banners, torches });
   for (const u of units.list) if (u.team === team && !u.dying && u.kind !== 'crystal' && u.kind !== 'wall') units.hit(u, u, 'drown', u.pos, u.hp + 1);
   const where = at ? [at[0], at[2]] : null;
-  if (team === 'blue') { toast('Your power crystal was destroyed: defeat', 12); sfx('defeat'); logEvent('Your crystal was destroyed: defeat', null, where, 'blue'); return; }
-  const left = OPPONENTS.slice(0, setup.opponents).filter((t) => !eliminated.has(t));
+  if (watching) { // (every side's the computer's: the last one standing wins)
+    const left = GAME_TEAMS.filter((t) => !eliminated.has(t));
+    logEvent(`${TEAMS[team].name}'s crystal was destroyed: ${TEAMS[team].name} is out`, null, where, team);
+    if (left.length === 1) { toast(`${TEAMS[left[0]].name} wins!`, 12); sfx('victory'); logEvent(`${TEAMS[left[0]].name} is the last kingdom standing`, null, null, left[0]); }
+    else sfx('eliminated');
+    return;
+  }
+  const me = units.player;
+  if (team === me) { toast('Your power crystal was destroyed: defeat', 12); sfx('defeat'); logEvent('Your crystal was destroyed: defeat', null, where, me); return; }
+  const left = rivals().filter((t) => !eliminated.has(t));
   logEvent(`${TEAMS[team].name}'s crystal was destroyed: ${TEAMS[team].name} is out`, null, where, team);
-  if (!left.length) { toast(`${TEAMS[team].name}'s crystal is destroyed: victory!`, 12); sfx('victory'); logEvent('Every rival is out: victory!', null, null, 'blue'); }
+  if (!left.length && !eliminated.has(me)) { toast(`${TEAMS[team].name}'s crystal is destroyed: victory!`, 12); sfx('victory'); logEvent('Every rival is out: victory!', null, null, me); }
   else sfx('eliminated');
 }
 collapse.onEdit = edited; // and a fallen team's buildings coming apart
@@ -406,13 +437,21 @@ function snowyAt(x, y, z) {
   return y >= WATER_LEVEL + SNOW_TUNING.height + (h - 0.5) * 2 * SNOW_TUNING.jitter;
 }
 units.onStep = (u) => { if (u.cell && snowyAt(...u.cell)) splashes.snow(u.pos, u.yaw ?? 0, !!MOUNTS[u.kind]); };
-// Raise and Lower don't change the ground themselves: they mark voxels for villagers to fill or dig (one job holds
-// every mark; it's added back to the open jobs whenever there's new work in it).
-const sculpt = new SculptJob(terrain);
-const mines = new MineJob(terrain, null); // the god panel's open Mine orders, shared like sculpt's marks
-// Idle Lumberjacks and Miners mark the trees and ore they find on it too, only where the player's seen (Workers.seek).
-units.workers.seeking = { job: mines, seen: (x, z) => !fog.never(x, z) };
-units.workers.depots = depots; // (where workers take what they carry: the Keep, and houses for wheat)
+// Raise, Lower, Fill and Wall don't change the ground themselves: they mark voxels for villagers to fill or dig. Each
+// team has one job holding every mark of its (sculpt), and one holding its Mine orders (mines), each added back to its
+// workers' open jobs whenever there's new work in it.
+const sides = new Map(Object.keys(TEAMS).map((team) => [team, { sculpt: new SculptJob(terrain), mines: new MineJob(terrain, null) }]));
+const sideOf = (team) => sides.get(team) ?? sides.get('blue');
+// Whether a voxel's still to be filled for any team's marks (a wall section's: see Walls.update).
+const toFill = (x, y, z) => [...units.crews.values()].some((crew) => crew.toFill(x, y, z));
+// Every team's open jobs (a building can't go over anyone's site).
+const allJobs = () => [...units.crews.values()].flatMap((crew) => crew.jobs);
+for (const [team, crew] of units.crews) {
+  // Idle Lumberjacks and Miners mark the trees and ore they find on the Mine job too, only where their team's seen
+  // (Workers.seek); and they take what they carry to their team's Keep (and houses, for wheat).
+  crew.seeking = { job: sideOf(team).mines, seen: (x, z) => !fog.never(x, z, team) };
+  crew.depots = (block) => depots(block, team);
+}
 const torches = new Torches(terrain); // placed from the Build menu
 const banners = new Banners(terrain); // hung from the Editor's Build menu, and with the designs that have them
 // Walls (the god panel's Wall mode, see walls.js): each built section a target with hit points (a unit of kind 'wall',
@@ -427,7 +466,7 @@ walls.onBuilt = (s) => {
     s.unit = u;
   }
   const t = { cell: [s.x + s.out[0], s.y0 + s.h - 1, s.z + s.out[1]], wall: s.out };
-  if (s.torch && torches.fits(t.cell, t.wall) && !torches.at(...t.cell)) order(torches.add(t));
+  if (s.torch && torches.fits(t.cell, t.wall) && !torches.at(...t.cell)) order(torches.add(t), s.team);
 };
 walls.onGone = (s) => { if (s.unit && !s.unit.dying) s.unit.dying = 1e-4; }; // (its blocks all dug out)
 // Portcullises (the Build menu's, see gates.js): a gate in a team's wall that only its own team walks through. Made,
@@ -456,12 +495,15 @@ const GROUND_NORMALS = ['grass', 'dirt', 'sand', 'fringe', 'stone']; // (left ou
 const MENU_TUNING = { spin: 0.05 };
 // Slow motion (sandbox, - and + in steps of 0.1, for filming): everything but the camera runs at this share of real
 // time, from 0.1 to 1 (the units and their ragdolls, fire and smoke, water, the clock, flickers and glints).
-const GAME_SPEED = { speed: 1 };
+// background: the game going on while its tab's hidden (1), stepped from a timer (see step), or waiting (0). Online
+// play will need it on, so no one's game stops when they switch tabs.
+const GAME_SPEED = { speed: 1, background: 0 };
 const TUNING = [
   ['Time of day', [
     [S, 'timeOfDay', 'Time of day (hours)', 0, 24, 0.05],
     [S, 'timeSpeed', 'Clock speed (game hours per minute)', 0, 30, 0.1],
-    [GAME_SPEED, 'speed', 'Game speed, sandbox (- and +; the camera keeps full speed)', 0.1, 1, 0.1],
+    [GAME_SPEED, 'speed', 'Game speed (- and +: 0.1 to 1, then 2, 3 and 5; the camera keeps full speed)', 0.1, 5, 0.1],
+    [GAME_SPEED, 'background', 'Keep playing while the tab is hidden (0 off, 1 on)', 0, 1, 1],
     [S, 'latitude', 'Latitude (deg)', -70, 70, 0.5],
     [S, 'season', 'Season (sun declination, deg)', -23.4, 23.4, 0.1],
     [S, 'north', 'North on the map (deg)', -180, 180, 1],
@@ -909,6 +951,41 @@ const TUNING = [
   ['Training costs', [...Object.entries({ warrior: 'Warrior', barbarian: 'Barbarian', archer: 'Archer', spearman: 'Spearman', mage: 'Fire mage', priest: 'Priest', scout: 'Scout', knight: 'Knight' })
     .flatMap(([k, name]) => ['gold', 'iron', 'planks', 'wheat'].map((c) => [TRAINING_COST[k], c, `${name}: ${c} (new game)`, 0, 100, 1])),
     ...Object.keys(BUILD_EXTRA).flatMap((k) => ['gold', 'iron'].map((c) => [BUILD_EXTRA[k], c, `${BUILT_IN_DESIGNS[k]?.name ?? k} building: ${c} on top of its blocks (new game)`, 0, 100, 1]))]],
+  ['Performance', [
+    [POSE_TUNING, 'cull', 'Pose only units on screen (1), or every unit every frame (0)', 0, 1, 1],
+    [POSE_TUNING, 'cullRadius', 'A unit counts as on screen within this many voxels of the edge', 0, 10, 0.5],
+    [POSE_TUNING, 'halfBelow', 'Units drawn shorter than this (pixels) posed every other frame', 0, 200, 1],
+    [UNIT_TUNING, 'orderPathMs', 'Units sent somewhere: path search time a frame (ms; the rest wait their turn)', 0.5, 20, 0.5],
+    [WORK_TUNING, 'claimMs', 'Workers: time one search for a way to their work may take (ms; longer counts as no way)', 1, 100, 1],
+    [WORK_TUNING, 'retryMax', 'Work no worker could find a way to: tried again after at most this long (s; doubling from 1)', 1, 120, 1],
+    [UNIT_TUNING, 'joinSearch', 'Units sent together: cells each may search to join its leader\'s path', 100, 10000, 100],
+  ]],
+  ['Computer opponent', [
+    [CPU_TUNING, 'think', 'Seconds between its looks at the game (Normal; Easy x2, Hard x0.5)', 0.1, 10, 0.1],
+    [CPU_TUNING, 'workers', 'Workers it trains (Normal; Easy x0.6, Hard x1.3)', 1, 60, 1],
+    [CPU_TUNING, 'farms', 'Farms it keeps for each worker', 0, 5, 0.1],
+    [CPU_TUNING, 'farmsMin', 'And at least this many farms', 0, 60, 1],
+    [CPU_TUNING, 'trees', 'Trees it keeps marked to fell (more with more workers)', 0, 20, 1],
+    [CPU_TUNING, 'stone', 'Stone blocks it keeps marked to dig (more with more workers)', 0, 40, 1],
+    [CPU_TUNING, 'dirt', 'Dirt blocks it keeps marked to dig, for clay', 0, 40, 1],
+    [CPU_TUNING, 'ore', 'Iron and gold ore veins it keeps marked', 0, 10, 1],
+    [CPU_TUNING, 'scanStep', 'Columns it looks over for trees, stone and ore each look (a look round takes several)', 100, 20000, 100],
+    [CPU_TUNING, 'stock', 'Planks and bricks it stops gathering at (clay: half)', 10, 1000, 10],
+    [CPU_TUNING, 'shortMore', 'A building site short of something: Mine marks on where it comes from, times this', 1, 6, 0.1],
+    [CPU_TUNING, 'shortOthers', 'And Mine marks on everything else meanwhile, times this', 0, 1, 0.05],
+    [CPU_TUNING, 'range', 'How far from its Keep it gathers, builds and farms (voxels)', 10, 100, 1],
+    [CPU_TUNING, 'farMax', 'Nothing it needs left near: it looks further, up to this many times as far', 1, 6, 0.5],
+    [CPU_TUNING, 'markLife', 'Seconds before it gives up on a Mine mark no one has dug', 10, 600, 5],
+    [CPU_TUNING, 'firstAttack', 'Seconds before its first attack (Normal; Easy x1.6, Hard x0.6)', 0, 1800, 10],
+    [CPU_TUNING, 'wave', 'Fighters in its first attack (Normal; Easy x0.7, Hard x1.4)', 1, 60, 1],
+    [CPU_TUNING, 'waveGrow', 'More fighters in each attack after', 0, 20, 1],
+    [CPU_TUNING, 'defend', 'How near its Keep an enemy comes before its army turns on it (voxels)', 5, 80, 1],
+    [CPU_TUNING, 'regroup', 'Seconds between sending an attack\'s idle fighters on again', 2, 60, 1],
+    [CPU_TUNING, 'levelDelta', 'Levelling a site (nowhere flat): its floor at most this far from the Keep\'s height', 0, 10, 1],
+    [CPU_TUNING, 'levelOff', 'Levelling: what each voxel off the Keep\'s height counts as, in voxels moved', 0, 40, 1],
+    [CPU_TUNING, 'levelMax', 'Levelling: the most work it takes on (voxels dug and filled)', 10, 1000, 10],
+    [CPU_TUNING, 'levelLife', 'Levelling: seconds it gives a site before trying another', 30, 1200, 10],
+  ]],
   ['Production', [
     [POP_TUNING, 'keep', 'Population room the Keep gives (new game)', 0, 50, 1],
     [POP_TUNING, 'house', 'Population room each house gives (new game)', 0, 50, 1],
@@ -1338,10 +1415,11 @@ function showCounts() {
 }
 function showRibbonFrame() {
   if (inventory) {
-    const pop = population(), room = popRoom();
+    const pop = population(units.player), room = popRoom(units.player);
     setCell('[data-res="people"]', `${pop}/${room}`, pop >= room);
   }
-  const t = clockText(gameClock - startClock), el = ribbon.querySelector('.time .n');
+  // (and the game speed, when it isn't 1: see stepGameSpeed)
+  const t = clockText(gameClock - startClock) + (GAME_SPEED.speed !== 1 && speedKeys() ? ` ${speedText(GAME_SPEED.speed)}` : ''), el = ribbon.querySelector('.time .n');
   if (el && el.textContent !== t) el.textContent = t;
 }
 
@@ -1349,7 +1427,9 @@ function showRibbonFrame() {
 // been (villagers at a key press, insta-build, every block free), or a new game: INVENTORY_TUNING.startWorkers workers
 // (one), and the team's inventory, which its workers fill by mining and building uses up (see inventory.js).
 const mode = { name: null };
-let inventory = null;
+let inventory = null; // the player's (units.player's: what the HUD shows); each team's is on its Workers
+// A team's inventory (null in the sandbox and the Editor: every block's free there).
+const invOf = (team) => units.crew(team).inventory;
 const menu = document.getElementById('menu');
 function startGame(name) {
   mode.name = name;
@@ -1375,10 +1455,11 @@ function startGame(name) {
   } else if (name === 'sandbox') {
     for (const [dx, dz] of [[-3, -2], [2, -3], [0, 2], [4, 3]]) units.spawn(cx + dx, cz + dz);
   } else {
-    // The starts (see newGameStarts): the camera over the player's, a power crystal at each (over its Keep, see
-    // crystals.js) and an idle worker outside each opponent's door (red, yellow, purple).
+    // The starts (see newGameStarts): the camera over the player's; at each, a power crystal (over its Keep, see
+    // crystals.js), the team's inventory and INVENTORY_TUNING.startWorkers workers outside its door, every team alike
+    // (the player's, then the opponents', in GAME_TEAMS' order).
     const starts = newStarts;
-    [cx, cz] = starts.blue;
+    [cx, cz] = starts.you;
     camera.target[0] = cx;
     camera.target[2] = cz;
     camera.target[1] = terrain.groundAt(cx, cz);
@@ -1395,28 +1476,26 @@ function startGame(name) {
       const { cell: [x, y, z], dir: [dx, dz] } = plan.spawn, a = (k % 3) - 1, b = 3 + Math.floor(k / 3);
       return [x + dx * b - dz * a + 0.5, z + dz * b + dx * a + 0.5, y + 2];
     };
-    for (const [team, plan] of keeps) for (const t of plan.torches ?? []) if (!torches.at(...t.cell)) torches.add(t).torch.lit = true;
-    for (const [team, plan] of keeps) for (const b of plan.banners ?? []) banners.add(b);
-    finishBuilding({ plan: keeps.get('blue'), key: 'keep', name: 'Keep' }, true);
-    crystal(cx, cz, 'blue');
-    starts.opponents.forEach(([x, z], i) => {
-      crystal(x, z, OPPONENTS[i]);
-      const [wx, wz, wy] = outside(keeps.get(OPPONENTS[i]), 1);
-      units.spawn(wx, wz, wy, OPPONENTS[i], 'worker');
-    });
-    units.controls = 'blue'; // (the player's orders are for blue's villagers only)
-    inventory = new Inventory(units.workers);
-    units.workers.inventory = inventory;
-    farms.inventory = inventory;
-    inventory.onChange = showCounts;
-    inventory.onShare = showCosts;
-    inventory.start();
+    for (const plan of keeps.values()) for (const t of plan.torches ?? []) if (!torches.at(...t.cell)) torches.add(t).torch.lit = true;
+    for (const plan of keeps.values()) for (const b of plan.banners ?? []) banners.add(b);
     const n = Math.max(1, Math.round(INVENTORY_TUNING.startWorkers));
-    for (let i = 0; i < n; i++) { // (outside the Keep's door)
-      const [wx, wz, wy] = outside(keeps.get('blue'), i + 1);
-      units.spawn(wx, wz, wy);
-    }
+    [starts.you, ...starts.opponents].forEach(([x, z], i) => {
+      const team = GAME_TEAMS[i], crew = units.crew(team);
+      finishBuilding({ plan: keeps.get(team), key: 'keep', name: 'Keep', team }, true);
+      crystal(x, z, team);
+      crew.inventory = new Inventory(crew);
+      crew.inventory.start();
+      for (let k = 0; k < n; k++) { // (outside the Keep's door)
+        const [wx, wz, wy] = outside(keeps.get(team), k + 1);
+        units.spawn(wx, wz, wy, team, 'worker');
+      }
+    });
+    playAs(GAME_TEAMS[0]);
     if (setup.fog) setFog(true);
+    // The opponents played by the computer, each at its own level from the setup (none for an idle one); the player's
+    // side too when they're watching.
+    const levelOf = (i) => (i ? setup.cpu[i - 1] : watching ? setup.self : 'off');
+    cpus = GAME_TEAMS.flatMap((t, i) => (levelOf(i) === 'off' ? [] : [new Cpu(t, cpuGame, levelOf(i))]));
   }
   buildRibbon();
   showCounts();
@@ -1428,30 +1507,57 @@ function startGame(name) {
 for (const b of menu.querySelectorAll('button[data-mode]')) {
   b.addEventListener('click', () => { if (b.dataset.mode === 'new') showSetup(true); else startGame(b.dataset.mode); b.blur(); });
 }
-// New game's setup screen: map size, who you face (Blue's you; the opponents come in order, Red, Yellow, Purple), the
-// world's options and rules, then the page starts over with them (see setup).
+// New game's setup screen: map size, who you face (your colour, picked under your banner; the opponents take the
+// others in order, each at its own level, picked under its banner), the world's options and rules, then the page
+// starts over with them (see setup).
 const setupBox = menu.querySelector('.menu-setup');
 const menuMain = menu.querySelector('.menu-main');
-const setupState = { opponents: 1 };
+const setupState = { opponents: 1, you: 'blue', self: 'human', cpu: ['normal', 'normal', 'normal'] };
 const facesEl = document.getElementById('faces');
+// A computer opponent's levels, as the setup shows them.
+const CPU_LEVELS_SHOWN = {
+  human: ['You', 'You play this side'], off: ['Idle', 'Stands still'], easy: ['Easy', 'Slow, small attacks'], normal: ['Normal', 'A fair fight'], hard: ['Hard', 'Quick, early attacks'],
+};
+// A level stepper: k, the opponent's (or -1, your side's); level, as CPU_LEVELS_SHOWN; name, the side's.
+const levelStepper = (k, level, name) => {
+  const [shown, about] = CPU_LEVELS_SHOWN[level], who = k < 0 ? 'Who plays your side' : `How ${name} plays`;
+  return `<div class="level" role="group" aria-label="${who}" title="${about}"><button type="button" class="btn" data-level="${k}" data-step="-1" aria-label="${who}: back">${svg('M15 5l-7 7 7 7', 14, 4)}</button>` +
+    `<span class="h-disp" aria-live="polite">${shown}</span><button type="button" class="btn" data-level="${k}" data-step="1" aria-label="${who}: next">${svg('M9 5l7 7-7 7', 14, 4)}</button></div>`;
+};
+// Who can play your side: you, or the computer at a level while you watch.
+const SELF_LEVELS = ['human', 'easy', 'normal', 'hard'];
 function showFaces() {
-  const n = setupState.opponents;
-  facesEl.innerHTML = '<div class="rod tex-plank"></div>' + ['blue', ...OPPONENTS].map((team, i) => {
+  const n = setupState.opponents, you = setupState.you, human = setupState.self === 'human';
+  facesEl.innerHTML = '<div class="rod tex-plank"></div>' + [you, ...opponentsOf(you)].map((team, i) => {
     const name = TEAMS[team].name;
-    if (i === 0) return `<div class="face ${team}"><div class="bn t-${team}" role="group" aria-label="${name}, you"><span class="h-disp">${name}</span><small>You</small>${emblem(team, 30)}</div></div>`;
+    if (i === 0) {
+      const colours = COLOURS.map((t) => `<button type="button" class="t-${t}" data-you="${t}" aria-pressed="${t === you}" aria-label="Play as ${TEAMS[t].name}" title="Play as ${TEAMS[t].name}">${emblem(t, 14)}</button>`).join('');
+      return `<div class="face ${team}"><div class="bn t-${team}" role="group" aria-label="${name}, ${human ? 'you' : 'the computer, watched'}"><span class="h-disp">${name}</span><small>${human ? 'You' : 'Computer'}</small>${emblem(team, 30)}</div>` +
+        `<div class="colours" role="group" aria-label="Your colour">${colours}</div>${levelStepper(-1, setupState.self, name)}</div>`;
+    }
     if (i <= n) {
       return `<div class="face ${team}"><div class="bn t-${team}" role="group" aria-label="${name}, an opponent"><span class="h-disp">${name}</span><small>Opponent</small>${emblem(team, 30)}</div>` +
-        (i === n ? `<button type="button" class="btn rm" data-opp="${i - 1}" aria-label="Remove ${name}">${svg('M5 5l14 14M19 5L5 19', 14, 4.5)}</button>` : '') + '</div>';
+        (i === n && (human || n > 1) ? `<button type="button" class="btn rm" data-opp="${i - 1}" aria-label="Remove ${name}">${svg('M5 5l14 14M19 5L5 19', 14, 4.5)}</button>` : '') +
+        `${levelStepper(i - 1, setupState.cpu[i - 1], name)}</div>`;
     }
     return `<div class="face ${team}"><button type="button" class="roll t-${team}" data-opp="${i}" aria-label="Add ${name}">${emblem(team, 18)}<span class="h-disp" style="font-size: 17px">${name}</span></button><span class="hint">Click to add</span></div>`;
   }).join('');
   showSetupSummary();
 }
 facesEl.addEventListener('click', (e) => {
-  const b = e.target.closest('[data-opp]');
+  const b = e.target.closest('[data-opp], [data-you], [data-level]');
   if (!b) return;
-  setupState.opponents = +b.dataset.opp;
+  if (b.dataset.you) setupState.you = b.dataset.you;
+  else if (b.dataset.level) { // (one on or back, round from Hard to the first and back)
+    const k = +b.dataset.level, names = k < 0 ? SELF_LEVELS : CPU_LEVEL_NAMES, m = names.length;
+    const at = names.indexOf(k < 0 ? setupState.self : setupState.cpu[k]), next = names[(at + +b.dataset.step + m) % m];
+    if (k < 0) setupState.self = next;
+    else setupState.cpu[k] = next;
+    if (setupState.self !== 'human') setupState.opponents = Math.max(1, setupState.opponents); // (two sides at least)
+  } else setupState.opponents = +b.dataset.opp;
+  const again = b.dataset.you ? `[data-you="${b.dataset.you}"]` : b.dataset.level ? `[data-level="${b.dataset.level}"][data-step="${b.dataset.step}"]` : null;
   showFaces();
+  if (again) facesEl.querySelector(again)?.focus(); // (the same button again, made anew)
 });
 // The form from a setup (parseSetup's): the last new game's, or this one's.
 function fillSetup(was) {
@@ -1459,6 +1565,9 @@ function fillSetup(was) {
     const r = setupBox.querySelector(`input[name="${name}"][value="${value}"]`);
     if (r) r.checked = true;
   }
+  setupState.you = was.you;
+  setupState.self = was.self;
+  setupState.cpu = [...was.cpu];
   document.getElementById('setup-fog').checked = was.fog;
   document.getElementById('setup-bridge').checked = was.bridge;
   mountInput.value = was.mountains;
@@ -1498,11 +1607,13 @@ setupBox.addEventListener('change', () => showSetupSummary());
 function showSetupSummary() {
   const pick = (name) => setupBox.querySelector(`input[name="${name}"]:checked`)?.value;
   const n = setupState.opponents;
-  document.getElementById('setup-teams').innerHTML = ['blue', ...OPPONENTS.slice(0, n)].map((t) => teamBanner(t)).join('');
+  document.getElementById('setup-teams').innerHTML = [setupState.you, ...opponentsOf(setupState.you).slice(0, n)].map((t) => teamBanner(t)).join('');
   const size = { small: 'Small', medium: 'Medium', large: 'Large', huge: 'Huge' }[pick('map') ?? 'medium'];
   const sym = { none: 'no symmetry', x: 'mirrored left-right', z: 'mirrored top-bottom', both: 'mirrored in quarters' }[pick('mirror') ?? 'none'];
   const seedWord = seedRandom.checked ? 'a new seed' : `seed ${esc(seedInput.value.trim() || '7')}`;
-  document.getElementById('setup-summary').innerHTML = `${size} map · ${n ? `${n} opponent${n > 1 ? 's' : ''}` : 'no opponents'} · ${sym} · ` +
+  const levels = setupState.cpu.slice(0, n).map((l) => CPU_LEVELS_SHOWN[l][0].toLowerCase());
+  const cpu = levels.every((l) => l === levels[0]) ? levels[0] : levels.join(', ');
+  document.getElementById('setup-summary').innerHTML = `${size} map · ${setupState.self === 'human' ? `you're ${TEAMS[setupState.you].name}` : `watching ${TEAMS[setupState.you].name} (${CPU_LEVELS_SHOWN[setupState.self][0].toLowerCase()})`} · ${n ? `${n} opponent${n > 1 ? 's' : ''} (${cpu})` : 'no opponents'} · ${sym} · ` +
     `${Math.round(+waterInput.value)}% water · fog ${document.getElementById('setup-fog').checked ? 'on' : 'off'} · ${seedWord}`;
 }
 seedInput.addEventListener('input', showSetupSummary);
@@ -1511,7 +1622,7 @@ setupBox.querySelector('[data-setup="start"]').addEventListener('click', () => {
   const pick = (name) => setupBox.querySelector(`input[name="${name}"]:checked`)?.value;
   location.hash = `seed=${encodeURIComponent(chosenSeed())}&new=1&map=${pick('map') ?? 'medium'}&opp=${setupState.opponents}&mirror=${pick('mirror') ?? 'none'}` +
     `&fog=${document.getElementById('setup-fog').checked ? 1 : 0}&mount=${mountInput.value}&water=${waterInput.value}&res=${resInput.value}` +
-    `&bridge=${document.getElementById('setup-bridge').checked ? 1 : 0}`;
+    `&bridge=${document.getElementById('setup-bridge').checked ? 1 : 0}&you=${setupState.you}&self=${setupState.self}&cpu=${setupState.cpu.join('.')}`;
   try { localStorage.setItem(SETUP_KEY, location.hash); } catch (err) { /* storage blocked: not remembered */ }
   location.reload();
 });
@@ -1565,7 +1676,7 @@ function onLookout(u) {
 const buildingSightOf = (b) => BUILDING_SIGHT[b.key] ?? FOG_TUNING.buildingSight;
 
 
-// A new game's starts: the player's (blue) near one corner of the map, each opponent's (OPPONENTS) at another, the
+// A new game's starts: the player's near one corner of the map, each opponent's (OPPONENTS) at another, the
 // player's turned round where the map's symmetrical that way (so it's the same ground), else the nearest open
 // ground to that corner. A start is dry, flat (within a voxel over 5 × 5) grass with nothing standing on it.
 function startNear(cx, cz) {
@@ -1612,7 +1723,7 @@ function newGameStarts(opponents, mirror) {
     both: [[mx, mz, true], [X - 1 - pz, px, true], [pz, Z - 1 - px, true]],
   }[mirror];
   const opp = corners.slice(0, opponents).map(([x, z, exact]) => (exact ? [x, z] : startNear(x, z)));
-  return { blue: [px, pz], opponents: opp };
+  return { you: [px, pz], opponents: opp };
 }
 
 const finishedPlans = []; // finished buildings, { plan, key }, to be taken on (see finishBuilding) after the units' update
@@ -1832,7 +1943,7 @@ function wallConfirm() {
     const voxels = wallVoxels(d);
     const solid = voxels.filter(([x, y, z]) => terrain.block(x, y, z) !== BLOCK.LEAVES);
     if (d.cmd === 'fill') fillOrder(voxels);
-    else if (d.unmark) unmarkMine(solid); // (started on a marked block: the box takes marks off)
+    else if (d.unmark) { if (solid.length) issue({ k: 'unmine', voxels: solid, veins: false }); } // (started on a marked block: the box takes marks off)
     else mineOrder(solid, false, false); // (else it adds to them)
     return;
   }
@@ -1868,17 +1979,17 @@ function buildAt(hit) {
   // it brings out faces that way.
   const toCam = build.press?.facing ?? build.facing ?? facingToward(x + 0.5, z + 0.5, camera.matrices().eye), make = BUILDINGS[build.item].plan;
   if (build.press) Object.assign(build.press, { x, z, y0 });
-  let plan = make(x, y0, z, toCam);
+  let plan = make(x, y0, z, toCam), facing = toCam;
   if (plan.spawn) {
     const [wx, wz] = FACING_DIRS[toCam];
     for (let f = 0; f < 4; f++) {
       const p = f === toCam ? plan : make(x, y0, z, f);
-      if (Math.round(p.spawn.dir[0]) === wx && Math.round(p.spawn.dir[1]) === wz) { plan = p; break; }
+      if (Math.round(p.spawn.dir[0]) === wx && Math.round(p.spawn.dir[1]) === wz) { plan = p; facing = f; break; }
     }
   }
   // (A building with a spawn point must let its unit walk out.)
-  const fits = canPlace(terrain, plan, y0, units.workers.jobs) && canExit(terrain, plan);
-  return { plan, fits, short: fits && !!inventory?.planShort(plan) };
+  const fits = canPlace(terrain, plan, y0, allJobs()) && canExit(terrain, plan);
+  return { plan, fits, short: fits && !!inventory?.planShort(plan), cell: [x, y0, z], facing };
 }
 
 // Dragging from where a building was pressed: its front turned towards the point on its floor's level under the cursor.
@@ -1994,32 +2105,11 @@ canvas.addEventListener('pointerdown', (e) => {
     if (on) spawns.turn(on);
     else if (p?.fits) spawns.add(p.cell, cameraFacing(p.cell));
   } else if (e.button === 0 && brush.tool === 'build' && build.item === 'torch') {
-    const p = torches.placement(brush.hit);
-    if (p?.fits) { order(torches.add(p)); orderSound('work'); }
+    if (brush.hit) issue({ k: 'torch', ...hitOf(brush.hit) });
   } else if (e.button === 0 && brush.tool === 'build' && build.item === 'portcullis') {
-    // A portcullis: in two sections of the player's own built wall (the one clicked and the next along it, on the side
-    // clicked nearer), its iron paid now (given back if it's called off before it's made).
-    const p = gates.placement(brush.hit, 'blue'), n = inventory ? Math.round(GATE_TUNING.iron) : 0;
-    if (!p) { toast('Click a section of your own wall to put a portcullis in it'); sfx('error'); }
-    else if (!p.fits) {
-      toast({ enemy: 'That wall isn\'t yours', unbuilt: 'That wall isn\'t finished yet', used: 'That wall can\'t take a portcullis (one\'s there already, or it\'s too low)',
-        straight: 'A portcullis needs two sections of wall side by side in a straight line, on the same level' }[p.why] ?? 'A portcullis can\'t go there');
-      sfx('error');
-    } else if (n > 0 && inventory.get(BLOCK.IRON) < n) { toast(`Not enough iron for a portcullis (${n})`); sfx('error'); }
-    else {
-      const job = gates.add(p, 'blue'), g = job.gate, base = job.cancel.bind(job);
-      // (A banner hung down over its opening comes down: the wall's own, or one hung on it in the Editor.)
-      for (const s of p.tiles) s.banner = false;
-      banners.list = banners.list.filter((b) => !p.tiles.some((s) => b.cell[0] - b.wall[0] === s.x && b.cell[2] - b.wall[1] === s.z));
-      if (n > 0) {
-        inventory.add(BLOCK.IRON, -n);
-        job.cancel = () => { if (!g.built) inventory?.add(BLOCK.IRON, n); base(); };
-      }
-      job.onMade = gateMade;
-      order(job);
-      orderSound('work');
-      if (!e.shiftKey) { setTool('select'); mouse.skip = true; }
-    }
+    // A portcullis (see the gate command): placed, back to the Select tool (Shift keeps on placing them).
+    if (!brush.hit) { toast(GATE_WHERE); sfx('error'); }
+    else if (issue({ k: 'gate', ...hitOf(brush.hit) }).ok && !e.shiftKey) { setTool('select'); mouse.skip = true; }
   } else if (e.button === 0 && brush.tool === 'build' && BANNER_ITEMS[build.item]) {
     // A banner (Editor): on the side of a block; a click on one there takes it down (or changes its length).
     const p = banners.placement(brush.hit, BANNER_ITEMS[build.item]);
@@ -2034,22 +2124,9 @@ canvas.addEventListener('pointerdown', (e) => {
 // A building placed (a click with the Build tool), where its ghost is: ordered for idle villagers to build.
 function placeBuilding(shift) {
   const b = buildAt(brush.hit);
-  // (In a new game, what it costs on top of its blocks, the Stables' gold, is paid as it's placed, and given back
-  // if it's cancelled before it's built.)
-  const extra = inventory ? buildExtra(build.item) : [], short = extra.filter(([blk, n]) => inventory.get(blk) < n);
-  if (b?.fits && short.length) { toast(`Not enough ${short.map(([blk]) => CURRENCY_NAMES[blk]).join(' or ')} for the ${BUILDINGS[build.item].name}`); sfx('error'); }
-  else if (b?.fits) {
-    const job = new BuildJob(terrain, b.plan), key = build.item, name = BUILDINGS[key].name;
-    Object.assign(job, { key, name, siteId: ++siteIds }); // (selectable while it's built: see siteAt)
-    for (const [blk, n] of extra) inventory.add(blk, -n);
-    if (extra.length) job.cancel = () => { if (!job.done) for (const [blk, n] of extra) inventory?.add(blk, n); };
-    // Once it's built: a building to select, its torches to be set (after the units' update, see finishBuilding).
-    job.onDone = () => finishedPlans.push({ plan: b.plan, key, name });
-    order(job);
-    orderSound('work');
-    // Placed: back to the Select tool (Shift keeps building, turned the same way).
-    if (!shift) setTool('select');
-  }
+  if (!b?.fits) return;
+  // Placed: back to the Select tool (Shift keeps building, turned the same way).
+  if (issue({ k: 'build', key: build.item, cell: b.cell, facing: b.facing }).ok && !shift) setTool('select');
 }
 canvas.addEventListener('pointerup', (e) => {
   if (possess.unit) return;
@@ -2229,6 +2306,7 @@ window.addEventListener('keydown', (e) => {
     case 'F3': setTool('raise'); break;
     case 'F4': setTool('lower'); break;
     case 'F5': setTool('flatten'); break;
+    case 'F9': e.preventDefault(); switchTeam(); break;
     case 'KeyM': setMinimapCollapsed(!minimapEl.classList.contains('collapsed')); break;
     case 'Period': case 'NumpadDecimal': if (mode.name === 'new') nextIdle(); break;
     case 'Space': e.preventDefault(); goToAlert(); break;
@@ -2240,8 +2318,8 @@ window.addEventListener('keydown', (e) => {
     case 'KeyN': if (mode.name === 'sandbox') spawnAtCursor(e.shiftKey ? 'red' : 'blue', spawnKind); break;
     case 'KeyI': if (mode.name !== 'new') toggleInsta(); break;
     case 'KeyO': if (mode.name === 'sandbox') toggleFog(); break;
-    case 'Minus': case 'NumpadSubtract': if (mode.name === 'sandbox') setGameSpeed(GAME_SPEED.speed - 0.1); break;
-    case 'Equal': case 'NumpadAdd': if (mode.name === 'sandbox') setGameSpeed(GAME_SPEED.speed + 0.1); break;
+    case 'Minus': case 'NumpadSubtract': if (speedKeys()) stepGameSpeed(-1); break;
+    case 'Equal': case 'NumpadAdd': if (speedKeys()) stepGameSpeed(1); break;
     case 'BracketLeft': setRadius(brush.radius - 1); break;
     case 'BracketRight': setRadius(brush.radius + 1); break;
     case 'KeyP': camera.ortho = !camera.ortho; break;
@@ -2289,19 +2367,29 @@ function keyboardCamera(dt) {
   }
   if (right || fwd) camera.pan(right * pan, fwd * pan, SIZE);
   camera.orbit(0, (k('PageUp') - k('PageDown')) * 1.0 * dt);
-  if (mode.name === 'sandbox') return; // (- and + set the game speed there instead)
+  if (speedKeys()) return; // (- and + set the game speed there instead)
   if (keys.has('Equal') || keys.has('NumpadAdd')) camera.zoom(Math.exp(-1.5 * dt));
   if (keys.has('Minus') || keys.has('NumpadSubtract')) camera.zoom(Math.exp(1.5 * dt));
 }
 
-// Slow motion (sandbox): - and + step the game speed down or up by 0.1, from 0.1 to 1.
+// Slow motion and fast forward (sandbox and New game; - and + zoom the camera in the Editor): - and + step the game
+// speed down or up by 0.1 from 0.1 to 1, and over 1 through FAST_SPEEDS. Only this screen's game: an online one (later)
+// keeps to the host's.
+const FAST_SPEEDS = [1, 2, 3, 5];
+const speedKeys = () => mode.name === 'sandbox' || mode.name === 'new';
+const speedText = (v) => `×${v >= 1 ? Math.round(v * 10) / 10 : v.toFixed(1)}`;
+function stepGameSpeed(dir) {
+  const v = GAME_SPEED.speed;
+  if (dir > 0) setGameSpeed(v < 1 ? v + 0.1 : FAST_SPEEDS.find((f) => f > v + 1e-6) ?? FAST_SPEEDS.at(-1));
+  else setGameSpeed(v > 1 ? FAST_SPEEDS.findLast((f) => f < v - 1e-6) : v - 0.1);
+}
 function setGameSpeed(v) {
   const was = GAME_SPEED.speed;
-  GAME_SPEED.speed = clamp(Math.round(v * 10) / 10, 0.1, 1);
+  GAME_SPEED.speed = clamp(Math.round(v * 10) / 10, 0.1, FAST_SPEEDS.at(-1));
   if (GAME_SPEED.speed !== was) sfx(GAME_SPEED.speed < was ? 'slowDown' : 'speedUp');
   tuning.refresh();
   showSpeed();
-  toast(`Game speed ×${GAME_SPEED.speed.toFixed(1)}`, 1.2);
+  toast(`Game speed ${speedText(GAME_SPEED.speed)}`, 1.2);
 }
 
 // --- Brush and units ---------------------------------------------------------------------------------------
@@ -2351,10 +2439,7 @@ function targetAt(x, y) {
 // Sends the selected fighters (all but workers) of other teams than target's to attack it (an archer, spearman or mage
 // out of range walks up to its range first; workers don't fight). Returns whether any went.
 function attackOrder(target) {
-  const sel = units.commandable().filter((u) => u.team !== target.team && u.kind !== 'worker');
-  for (const u of sel) units.attack(u, target, true, true);
-  if (sel.length) orderSound('attack');
-  return sel.length > 0;
+  return issue({ k: 'attack', units: ids(units.commandable()), target: target.id }).ok;
 }
 
 // Select tool click: picks a unit (of either team); left click only ever selects (orders are right click, the command
@@ -2451,45 +2536,45 @@ function withVeins(voxels) {
 function mineOrder(voxels, veins = false, toggle = true) {
   if (!voxels.length) return;
   // A click on what's already marked takes its marks off instead (with Shift, the whole vein's or forest's).
-  if (toggle && !insta.on && isMarked(voxels[0])) { unmarkMine(veins ? withVeins(voxels) : voxels); return; }
-  orderSound('work');
-  const job = insta.on ? new MineJob(terrain, null) : mines;
-  // (Not a wall or a building: not the player's own, and enemies' walls are knocked down, not mined. The Editor mines
+  issue({ k: toggle && !insta.on && isMarked(voxels[0]) ? 'unmine' : 'mine', voxels, veins });
+}
+// A team's Mine order (see mineOrder; veins: each ore's whole vein, each tree's forest).
+function mineFor(team, voxels, veins) {
+  const crew = units.crew(team), job = insta.on ? new MineJob(terrain, null) : sideOf(team).mines;
+  // (Not a wall or a building: not the team's own, and enemies' walls are knocked down, not mined. The Editor mines
   // anything, to change what's built.)
   const free = mode.name === 'editor';
   for (const [x, y, z] of veins ? withVeins(voxels) : voxels) if (free || (!walls.at(x, y, z) && !buildings.at.has(terrain.index(x, y, z)))) job.add(x, y, z);
-  if (insta.on) units.workers.finish(job);
-  else if (!job.done && !units.workers.jobs.includes(job)) units.workers.add(job);
+  if (insta.on) crew.finish(job);
+  else if (!job.done && !crew.jobs.includes(job)) crew.add(job);
 }
-// Whether voxel c is marked for mining (a log: any of its tree's trunk).
-function isMarked(c) {
+// Whether voxel c is marked for mining by a team (a log: any of its tree's trunk).
+function isMarked(c, team = units.player) {
+  const { mines } = sideOf(team);
   if (terrain.block(...c) !== BLOCK.LOG) return mines.has(...c);
   const trunk = findTrunk(terrain, ...c);
   return !!trunk && trunkLogs(terrain, ...trunk).some((q) => mines.has(...q));
 }
-// Takes the Mine marks off these voxels (a log: off its whole trunk).
-function unmarkMine(voxels) {
+// Takes a team's Mine marks off these voxels (a log: off its whole trunk).
+function unmarkMine(voxels, team = units.player) {
+  const { mines } = sideOf(team);
   for (const c of voxels) {
     if (terrain.block(...c) !== BLOCK.LOG) { mines.remove(...c); continue; }
     const trunk = findTrunk(terrain, ...c);
     for (const q of trunk ? trunkLogs(terrain, ...trunk) : [c]) mines.remove(...q);
   }
-  sfx('toggleOff');
 }
 // Fill (the god panel's): an open order like a building's, on the shared sculpt job: idle workers within
 // WORK_TUNING.jobRange take its columns, each the nearest to it, and fill them with the palette's block (in a new game, from the inventory; marks it can't
 // cover show yellow). Delete clears its marks under the brush.
 function fillOrder(voxels) {
-  if (voxels.length) { sculptMark(voxels, true, palette.block, true); orderSound('work'); }
+  if (voxels.length) issue({ k: 'fill', voxels, block: palette.block });
 }
 // Farm (6): an open order on the shared farm job (farm.js): idle workers within WORK_TUNING.jobRange till the marked
 // grass or dirt tops, wheat grows there, and they reap it when it's ripe. Insta-build tills them at once. Delete clears
 // farms under the brush.
 function farmOrder(cells) {
-  if (!cells.length) return;
-  orderSound('work');
-  farms.mark(cells, insta.on);
-  farms.update(0, units.workers);
+  if (cells.length) issue({ k: 'farm', cells });
 }
 // Farm's box, dragged out on the plane of the top first pressed: { cell, ax, az, bx, bz, plane }.
 const farmDraw = { d: null };
@@ -2522,10 +2607,10 @@ function wallDragTo(clientX, clientY) {
 }
 // The wall line d would order (see Walls.line), and the way its outer face looks: away from its team's Keep (or, with
 // none, towards the camera), as one of x or z (where its torches lean out and its banners face).
-function wallPlan(d) {
+function wallPlan(d, team = units.player) {
   const L = walls.line(d.a, d.b, d.y), [sx, sz] = L.dir;
   const mid = [(d.a[0] + d.b[0]) / 2 + 0.5, (d.a[1] + d.b[1]) / 2 + 0.5];
-  const keep = keeps.get('blue'), box = keep && planBox(keep);
+  const keep = keeps.get(team), box = keep && planBox(keep);
   const from = box ? [(box.lo[0] + box.hi[0]) / 2, (box.lo[2] + box.hi[2]) / 2] : null;
   let p = [-sz, sx];
   if (p[0] && p[1]) p = [p[0], 0]; // (a diagonal: out along x)
@@ -2535,12 +2620,8 @@ function wallPlan(d) {
   return { ...L, out: p };
 }
 function wallOrder(d) {
-  const block = wallBlock(palette.block);
-  if (!block) { toast('Walls are built of planks or bricks', 3); return; }
-  const P = wallPlan(d);
-  if (!P.cols.length) return;
-  sculptMark(walls.order(P.cols, block, 'blue', P.out), true, block, true);
-  orderSound('work');
+  const col = ([x, z]) => [clamp(x, 0, SIZE[0] - 1), clamp(z, 0, SIZE[2] - 1)];
+  issue({ k: 'wall', a: col(d.a), b: col(d.b), y: clamp(d.y, 0, SIZE[1] - 1), block: palette.block });
 }
 
 // Mine (E; 'dig' inside) and Fill (U): a click on a block, or a box drawn in steps (wall.drawing with cmd set, its
@@ -2597,37 +2678,32 @@ function toggleInsta() {
   if (mode.name === 'sandbox') sfx(insta.on ? 'toggleOn' : 'toggleOff');
 }
 instaButton.addEventListener('click', (e) => { toggleInsta(); e.currentTarget.blur(); });
-function order(job) {
-  if (insta.on) units.workers.finish(job);
-  else units.workers.add(job);
+// A job for a team's workers (insta-build: done at once).
+function order(job, team = units.player) {
+  const crew = units.crew(team);
+  if (insta.on) crew.finish(job);
+  else crew.add(job);
 }
-// Raise/Lower marks: onto the shared sculpt job for the villagers, or (insta-build) done at once.
-function sculptMark(voxels, add, block, tall = false) {
+// Raise/Lower, Fill and Wall marks: onto the team's sculpt job for its villagers, or (insta-build) done at once.
+function sculptMark(voxels, add, block, tall = false, team = units.player) {
+  const crew = units.crew(team), { sculpt } = sideOf(team);
   if (insta.on) {
     const job = new SculptJob(terrain);
     job.markVoxels(voxels, add, block, tall);
-    units.workers.finish(job);
+    crew.finish(job);
     return;
   }
   sculpt.markVoxels(voxels, add, block, tall);
-  if (!units.workers.jobs.includes(sculpt)) units.workers.add(sculpt);
+  if (!crew.jobs.includes(sculpt)) crew.add(sculpt);
 }
 
+// Delete: the open order under the cursor called off (see the clear command), or the Editor's spawn point there.
 function cancelJobAtCursor() {
   const hit = pick(camera.matrices().invViewProj);
   if (!hit) return;
   const sp = spawns.placement(hit), on = sp && spawns.at(...sp.cell);
   if (on) { spawns.remove(on); return; } // a spawn point
-  const x = Math.floor(hit.point[0]), z = Math.floor(hit.point[2]);
-  if (farms.has(x, z)) { // farms: those under the brush
-    const x0 = x - Math.floor((brush.radius - 1) / 2), z0 = z - Math.floor((brush.radius - 1) / 2);
-    farms.unmark(x0, z0, x0 + brush.radius, z0 + brush.radius);
-    return;
-  }
-  const job = units.workers.jobs.find((j) => j.contains(x, z));
-  if (job === sculpt) sculpt.unmark(hit, brush.radius); // just the marks under the brush
-  else if (job === mines) { const x0 = x - Math.floor((brush.radius - 1) / 2), z0 = z - Math.floor((brush.radius - 1) / 2); mines.unmark(x0, z0, x0 + brush.radius, z0 + brush.radius); }
-  else if (job) units.workers.cancel(job);
+  issue({ k: 'clear', ...hitOf(hit), radius: brush.radius });
 }
 
 // Right click: the selected villagers go there, or attack the enemy of theirs clicked (Shift: once they've done what
@@ -2639,9 +2715,7 @@ function moveOrder(x, y, queued = false) {
   if (target && attackOrder(target)) return;
   const { origin, dir } = rayAt(x, y);
   const hit = terrain.raycast(origin, dir);
-  if (!hit) return;
-  if (units.commandable().length) orderSound('move');
-  units.order(hit.point, hit.normal, false, queued);
+  if (hit) issue({ k: 'move', units: ids(units.commandable()), ...hitOf(hit), amove: false, queued });
 }
 
 // Attack-move (Q, then left click): the selected villagers go there, fighting the enemies they meet on the way; on an
@@ -2694,7 +2768,7 @@ const SPEC_INFO = {
   builder: { name: 'Builder', tip: 'Builds and fills first, and drops other work when building comes up.' },
   farmer: { name: 'Farmer', tip: 'Tills and reaps farms first, and drops other work when a farm needs it.' },
 };
-const selectedWorkers = () => units.list.filter((u) => u.selected && !u.dying && u.team === 'blue' && u.kind === 'worker');
+const selectedWorkers = () => units.list.filter((u) => u.selected && !u.dying && u.team === units.player && u.kind === 'worker');
 // (It keeps on with what it's doing till an order of its new kind is open: see Workers.preferOpen.)
 function setSpec(u, spec) {
   u.spec = spec;
@@ -2808,7 +2882,7 @@ function dockSite(job) {
     : missing.length ? `<span class="note">Needs ${missing.map(([blk, n]) => `${n} more ${name(blk)}`).join(' and ')} to finish</span>${pills(missing, true)}`
     : need.length ? `<span class="note">Still takes</span>${pills(need, false)}` : '<span class="note">Your workers are finishing it</span>';
   return `<div class="sec sel site${missing.length ? ' short' : ''}"><div class="live"><button type="button" class="btn" data-cmd="look" aria-label="Look at the ${esc(job.name)} (L)" ${tipAttr('Look at it', 'L', 'The camera goes to it.')}>${svg(ICON.look, 14, 3)}<span class="key">L</span></button></div>` +
-    `<div class="info"><div class="hd">${teamBanner('blue')}<h2>${esc(job.name)}</h2><span class="hp-n"></span></div>` +
+    `<div class="info"><div class="hd">${teamBanner(units.player)}<h2>${esc(job.name)}</h2><span class="hp-n"></span></div>` +
     `<span class="hp" role="img" aria-label="Blocks placed"><i style="width: 0%"></i></span>${status}</div></div>`;
 }
 // A building: its live view (L looks at it), name, health (its blocks still standing), and its training queue (click
@@ -2826,7 +2900,7 @@ function dockBuilding(b) {
   let html = `<div class="sec sel"><div class="live"><button type="button" class="btn" data-cmd="look" aria-label="Look at the ${esc(b.name)} (L)" ${tipAttr('Look at it', 'L', 'The camera goes to it.')}>${svg(ICON.look, 14, 3)}<span class="key">L</span></button></div>` +
     `<div class="info"><div class="hd">${teamBanner(b.team)}<h2>${esc(b.name)}</h2><span class="hp-n">${total} / ${total}</span></div>` +
     `<span class="hp" role="img" aria-label="Health"><i style="width: 100%"></i></span>${queue}</div></div>`;
-  if (!b.actions.length || b.team !== 'blue') return html;
+  if (!b.actions.length || b.team !== units.player) return html;
   const full = b.queue.length >= TRAIN_QUEUE;
   const slots = b.actions.slice(0, 3).map((k, i) => {
     const cost = trainingCost(k), afford = canAfford(k), t = +(PRODUCTION_TUNING[k] ?? 5).toFixed(1);
@@ -2856,13 +2930,13 @@ function dockUnits(sel) {
   const kinds = new Map();
   for (const u of sel) { const k = `${u.team} ${u.kind}`; kinds.set(k, (kinds.get(k) ?? 0) + 1); }
   const one = kinds.size === 1 ? [...kinds.keys()][0].split(' ')[1] : null;
-  const title = sel.length === 1 ? (u0 => (u0.team !== 'blue' ? `${TEAMS[u0.team].name} ` : '') + (CLASS_NAMES[u0.kind] ?? u0.kind))(sel[0])
+  const title = sel.length === 1 ? (u0 => (u0.team !== units.player ? `${TEAMS[u0.team].name} ` : '') + (CLASS_NAMES[u0.kind] ?? u0.kind))(sel[0])
     : one ? `${sel.length} ${PLURAL[one] ?? one}` : `${sel.length} units`;
   const group = selectionGroup(sel);
   const meta = group !== null ? `<span class="grp">Group <span class="key">${group}</span></span>` : ''; // (no HP number: the tiles' bars show it)
   const tiles = [...kinds].slice(0, mine.length ? 3 : 4).map(([k, n]) => {
     const [t, kind] = k.split(' '), name = n > 1 ? PLURAL[kind] ?? kind : CLASS_NAMES[kind] ?? kind;
-    return `<button type="button" class="btn kind${t !== 'blue' ? ' foe' : ''}" data-kind="${k}" aria-label="${name}, ${n}. Select only these" ${tipAttr(`${n} ${name}`, '', 'Click to select only these.', 'Shift+click to drop them from the selection.')}>` +
+    return `<button type="button" class="btn kind${t !== units.player ? ' foe' : ''}" data-kind="${k}" aria-label="${name}, ${n}. Select only these" ${tipAttr(`${n} ${name}`, '', 'Click to select only these.', 'Shift+click to drop them from the selection.')}>` +
       `${svg(UNIT_ICON[kind] ?? '', 22, 2.6)}<span class="key">×${n}</span><span class="hpb"><i></i></span></button>`;
   }).join('');
   const more = kinds.size > 3 && mine.length ? `<span class="note">+${kinds.size - 3}</span>` : '';
@@ -2876,7 +2950,7 @@ function dockUnits(sel) {
   const orders = [
     fighters ? { id: 'attack', name: 'Attack', icon: ICON.attack, tip: 'Then click a place: they fight what they meet on the way. Or click an enemy.', sub: 'Shift queues a waypoint.', run: () => arm('attack') } : null,
     { id: 'patrol', name: 'Patrol', icon: ICON.patrol, tip: 'Walk back and forth between two points, fighting anything on the way.', sub: 'Then click the far point. Shift adds points to the round.', run: () => arm('patrol') },
-    { id: 'stop', name: 'Stop', icon: ICON.stop, tip: 'Hold where they are.', run: () => units.stop() },
+    { id: 'stop', name: 'Stop', icon: ICON.stop, tip: 'Hold where they are.', run: () => issue({ k: 'stop', units: ids(units.commandable()) }) },
     workers ? { id: 'dig', name: 'Dig', icon: ICON.mine, tip: 'Then click blocks for workers to dig out, or drag to mark an area.', sub: 'The same as Craft\'s Mine.', run: () => toggleMode('dig') } : null,
   ];
   const slots = orders.map((o, i) => {
@@ -2898,9 +2972,9 @@ function dockUnits(sel) {
 dock.addEventListener('click', (e) => {
   const train = e.target.closest('button[data-train]'), queued = e.target.closest('[data-queued]');
   if (train) { trainUnit(buildings.selected, train.dataset.train); train.blur(); return; }
-  if (queued) { cancelTraining(buildings.selected, +queued.dataset.queued); return; }
+  if (queued) { if (buildings.selected) issue({ k: 'untrain', building: buildings.selected.id, index: +queued.dataset.queued }); return; }
   const spec = e.target.closest('button[data-spec]');
-  if (spec) { for (const u of selectedWorkers()) setSpec(u, spec.dataset.spec); spec.blur(); return; }
+  if (spec) { issue({ k: 'spec', units: ids(selectedWorkers()), spec: spec.dataset.spec }); spec.blur(); return; }
   const kind = e.target.closest('button[data-kind]');
   if (kind) {
     const [team, k] = kind.dataset.kind.split(' ');
@@ -2926,7 +3000,7 @@ dock.addEventListener('click', (e) => {
 // (Right click on Rally clears the rally waypoints.)
 dock.addEventListener('contextmenu', (e) => {
   e.preventDefault();
-  if (e.target.closest('[data-cmd="rally"]') && buildings.selected) { buildings.selected.rally = []; sfx('toggleOff'); }
+  if (e.target.closest('[data-cmd="rally"]') && buildings.selected) issue({ k: 'unrally', building: buildings.selected.id });
 });
 
 // Over the dock: the mode in use, in the player's colour (an order waiting for its click in ink), with what to do and
@@ -3077,9 +3151,9 @@ const OWNER_TEAM = Object.fromEntries(Object.entries(OWNER).map(([t, n]) => [n, 
 function worldInfo(x, y) {
   const u = unitAt(x, y);
   if (u && !u.hidden) {
-    if (u.kind === 'crystal') return { title: `${cap(u.team)} power crystal`, team: u.team, text: u.team === 'blue' ? 'Yours. Lose it and your kingdom falls.' : 'Destroy it and that kingdom falls.', sub: `${Math.max(0, Math.ceil(u.hp))} / ${Math.round(u.maxHp)} hit points` };
+    if (u.kind === 'crystal') return { title: `${cap(u.team)} power crystal`, team: u.team, text: u.team === units.player ? 'Yours. Lose it and your kingdom falls.' : 'Destroy it and that kingdom falls.', sub: `${Math.max(0, Math.ceil(u.hp))} / ${Math.round(u.maxHp)} hit points` };
     let sub = `${Math.max(0, Math.ceil(u.hp))} / ${Math.round(u.maxHp)} hit points`;
-    if (u.kind === 'worker' && u.team === 'blue') {
+    if (u.kind === 'worker' && u.team === units.player) {
       const job = SPEC_INFO[u.spec ?? 'worker']?.name ?? 'Any';
       const doing = u.carry?.n ? `carrying ${u.carry.n} ${CURRENCY_NAMES[u.carry.block] ?? { [BLOCK.PLANK]: 'planks', [BLOCK.BRICK]: 'bricks', [BLOCK.CLAY]: 'clay' }[u.carry.block] ?? 'blocks'}` : u.task ? 'working' : 'idle';
       sub += `. Priority: ${job}, ${doing}.`;
@@ -3090,13 +3164,13 @@ function worldInfo(x, y) {
   if (b) {
     const total = b.plan.blocks.length;
     const note = { keep: 'Workers bring what they gather here.', hut: `Room for ${Math.round(POP_TUNING.house)} more villagers.`, lookoutTower: 'A unit on its platform sees twice as far.' }[b.key] ?? '';
-    return { title: b.name, team: b.team, text: `${note}${b.team === 'blue' ? `${note ? ' ' : ''}Click to select it.` : ''}`, sub: `${standingBlocks(b).length} / ${total} blocks standing` };
+    return { title: b.name, team: b.team, text: `${note}${b.team === units.player ? `${note ? ' ' : ''}Click to select it.` : ''}`, sub: `${standingBlocks(b).length} / ${total} blocks standing` };
   }
   const job = siteAt(x, y);
   if (job) {
     const missing = (job.missing ?? []).filter(([, n]) => n > 0);
     const name = (blk) => CURRENCY_NAMES[blk] ?? { [BLOCK.PLANK]: 'planks', [BLOCK.BRICK]: 'bricks', [BLOCK.CLAY]: 'clay' }[blk] ?? 'blocks';
-    return { title: `${job.name} (being built)`, team: 'blue', text: 'Click to select it.', sub: missing.length ? `Needs ${missing.map(([blk, n]) => `${n} more ${name(blk)}`).join(' and ')} to finish.` : 'Your workers are building it.' };
+    return { title: `${job.name} (being built)`, team: units.player, text: 'Click to select it.', sub: missing.length ? `Needs ${missing.map(([blk, n]) => `${n} more ${name(blk)}`).join(' and ')} to finish.` : 'Your workers are building it.' };
   }
   const { origin, dir } = rayAt(x, y);
   const hit = terrain.raycast(origin, dir);
@@ -3104,9 +3178,9 @@ function worldInfo(x, y) {
   const [cx, cy, cz] = hit.point.map((v, i) => Math.floor(v - hit.normal[i] * 0.01));
   if (fog.on && fog.never(cx, cz)) return null;
   const w = walls.at(cx, cy, cz);
-  if (w?.unit && !w.unit.dying) return { title: 'Wall', team: w.team, text: w.team === 'blue' ? 'Yours. Enemies have to break through it.' : 'Attack it to break through.', sub: `${Math.max(0, Math.ceil(w.unit.hp))} / ${Math.round(w.unit.maxHp)} hit points` };
+  if (w?.unit && !w.unit.dying) return { title: 'Wall', team: w.team, text: w.team === units.player ? 'Yours. Enemies have to break through it.' : 'Attack it to break through.', sub: `${Math.max(0, Math.ceil(w.unit.hp))} / ${Math.round(w.unit.maxHp)} hit points` };
   for (const [team, plan] of keeps) {
-    if (plan.blocks.some(([bx, by, bz]) => bx === cx && by === cy && bz === cz)) return { title: `${cap(team)} Keep`, team, text: team === 'blue' ? 'Your workers bring what they gather here.' : 'Its power crystal is inside.' };
+    if (plan.blocks.some(([bx, by, bz]) => bx === cx && by === cy && bz === cz)) return { title: `${cap(team)} Keep`, team, text: team === units.player ? 'Your workers bring what they gather here.' : 'Its power crystal is inside.' };
   }
   const pile = units.workers.piles.find((p) => p.x === cx && p.z === cz && (p.y === cy || p.y === cy + 1));
   if (pile) return { title: `${pile.n} ${CURRENCY_NAMES[pile.block] ?? { [BLOCK.PLANK]: 'planks', [BLOCK.BRICK]: 'bricks', [BLOCK.CLAY]: 'clay' }[pile.block] ?? 'blocks'}`, text: 'Left on the ground: a worker will carry it to your Keep.' };
@@ -3122,7 +3196,7 @@ function worldInfo(x, y) {
     const f = farms.list.get(cx + SIZE[0] * cz);
     if (!f) return null;
     const grown = Math.min(1, (farms.clock - f.sown) / Math.max(1, FARM_TUNING.growTime));
-    return { title: 'Farm', team: 'blue', text: !f.tilled ? 'Marked: a worker will till it and sow wheat.' : farms.ripe(f) ? 'Ripe: a worker will reap the wheat.' : `Wheat growing, ${Math.round(100 * grown)}%.` };
+    return { title: 'Farm', team: f.team, text: !f.tilled ? 'Marked: a worker will till it and sow wheat.' : farms.ripe(f) ? 'Ripe: a worker will reap the wheat.' : `Wheat growing, ${Math.round(100 * grown)}%.` };
   }
   const info = BLOCK_INFO[blk]?.();
   if (!info) return null;
@@ -3184,13 +3258,13 @@ function crystalAttack(c) {
 }
 function renderCrystal() {
   if (crystalEl.hidden) return;
-  const c = crystalOf('blue'), max = c?.maxHp || CRYSTAL_TUNING.hp, hp = c && !c.dying ? Math.max(0, c.hp) : 0;
+  const c = crystalOf(units.player), max = c?.maxHp || CRYSTAL_TUNING.hp, hp = c && !c.dying ? Math.max(0, c.hp) : 0;
   const attack = crystalAttack(c);
-  const rivals = OPPONENTS.slice(0, setup.opponents).map((t) => {
+  const others = rivals().map((t) => {
     const r = crystalOf(t);
     return { t, hp: r && !r.dying && !eliminated.has(t) ? Math.max(0, Math.ceil(r.hp)) : 0, max: r?.maxHp || CRYSTAL_TUNING.hp };
   });
-  const key = `${Math.ceil(hp)}|${attack ? `${Math.round(attack.loss)}|${attack.dir}|${attack.n}|${attack.team}` : ''}|${rivals.map((r) => r.hp).join()}`;
+  const key = `${Math.ceil(hp)}|${attack ? `${Math.round(attack.loss)}|${attack.dir}|${attack.n}|${attack.team}` : ''}|${others.map((r) => r.hp).join()}`;
   if (key === crystalKey) return;
   crystalKey = key;
   const f = hp / max;
@@ -3202,7 +3276,7 @@ function renderCrystal() {
       `<circle cx="27" cy="27" r="22" fill="none" stroke="#3f8a3a" stroke-width="5" stroke-dasharray="${(arc * f).toFixed(1)} ${arc.toFixed(1)}" transform="rotate(-90 27 27)"/></svg>` +
       `<span style="position: absolute; left: 15px; top: 13px">${GEM('#2b1d12', 24)}</span></span>` +
       `<div class="calm-text"><span class="h-disp" style="font-size: 16px; line-height: 1">${hp > 0 ? 'Crystal safe' : 'Crystal destroyed'}</span>` +
-      `<span class="rivals-row">${rivals.map((r) => `<span class="${r.hp ? '' : 'out'}" aria-label="${TEAMS[r.t].name} crystal ${r.hp ? `${r.hp} of ${Math.round(r.max)}` : 'destroyed'}">${teamChip(r.t)}${TEAMS[r.t].name} ${r.hp || 'out'}</span>`).join('')}</span></div>`;
+      `<span class="rivals-row">${others.map((r) => `<span class="${r.hp ? '' : 'out'}" aria-label="${TEAMS[r.t].name} crystal ${r.hp ? `${r.hp} of ${Math.round(r.max)}` : 'destroyed'}">${teamChip(r.t)}${TEAMS[r.t].name} ${r.hp || 'out'}</span>`).join('')}</span></div>`;
     return;
   }
   crystalEl.className = 'panel alarm';
@@ -3214,7 +3288,7 @@ function renderCrystal() {
     (attack.dir ? `<div style="display: flex; align-items: center; gap: 8px; font: 900 14px/1 var(--body)">${svg(ICON.dir, 18, 3.5).replace('#2b1d12', '#fff3d6')}<span>From the ${attack.dir}</span></div>` : '') +
     `<div style="display: flex; align-items: center; gap: 8px">${attack.team ? `${teamChip(attack.team, 16, 'width: 24px; height: 24px; border-color: var(--cream)')}<span style="flex: 1; font: 800 13px/1 var(--body); white-space: nowrap">${attack.n} ${name} unit${attack.n > 1 ? 's' : ''}</span>` : '<span style="flex: 1"></span>'}` +
     `<button type="button" class="btn goto" data-goto aria-label="Go to your crystal (Space)">Go to it<span class="key">Space</span></button></div></div>` +
-    `<div class="rivals">${rivals.map((r) => `<div class="rival${r.hp ? '' : ' out'}">${teamChip(r.t, 16, 'width: 22px; height: 22px')}<span class="nm">${TEAMS[r.t].name}</span>` +
+    `<div class="rivals">${others.map((r) => `<div class="rival${r.hp ? '' : ' out'}">${teamChip(r.t, 16, 'width: 22px; height: 22px')}<span class="nm">${TEAMS[r.t].name}</span>` +
       `<span class="bar"><i style="width: ${(100 * r.hp / r.max).toFixed(0)}%"></i></span><span class="v">${r.hp || 'Out'}</span></div>`).join('')}</div>`;
 }
 crystalEl.addEventListener('click', (e) => { if (e.target.closest('[data-goto]')) { goToAlert(); e.target.closest('button').blur(); } });
@@ -3227,22 +3301,22 @@ const eventsEl = document.getElementById('events');
 let eventsOpen = false, eventsKey = '';
 // The middle of the player's kingdom: its crystal, or the map's middle.
 function home() {
-  const c = crystalOf('blue');
+  const c = crystalOf(units.player);
   return c ? [c.pos[0], c.pos[2]] : [SIZE[0] / 2, SIZE[2] / 2];
 }
 units.onHurt = (t, by) => {
-  if (!mode.name || mode.name === 'editor' || t.team !== 'blue' || !by || !TEAMS[by.team] || by.team === t.team || t.dying) return;
+  if (!mode.name || mode.name === 'editor' || t.team !== units.player || !by || !TEAMS[by.team] || by.team === t.team || t.dying) return;
   const name = TEAMS[by.team].name, time = clockText(gameClock - startClock), [hx, hz] = home();
-  const last = HUD_TUNING.threatLast;
+  const last = HUD_TUNING.threatLast, your = watching ? `${TEAMS[t.team].name}'s` : 'your'; // (watching: the watched side's)
   if (t.kind === 'crystal') {
     const dir = compass(t.pos[0], t.pos[2], by.pos[0], by.pos[2]);
-    events.threat(by.team, 'crystal', [t.pos[0], t.pos[2]], `${name} is attacking your crystal`, `${cap(dir)} · ${time}`, gameClock, last);
+    events.threat(by.team, 'crystal', [t.pos[0], t.pos[2]], `${name} is attacking ${your} crystal`, `${cap(dir)} · ${time}`, gameClock, last);
   } else if (t.kind === 'wall') {
     const dir = compass(hx, hz, t.pos[0], t.pos[2]);
-    events.threat(by.team, 'wall', [t.pos[0], t.pos[2]], `${name} is attacking your ${dir} wall`, `${cap(dir)} · ${time}`, gameClock, last);
+    events.threat(by.team, 'wall', [t.pos[0], t.pos[2]], `${name} is attacking ${your} ${dir} wall`, `${cap(dir)} · ${time}`, gameClock, last);
   } else {
     const dir = compass(hx, hz, t.pos[0], t.pos[2]);
-    events.threat(by.team, 'units', [t.pos[0], t.pos[2]], `${name} is attacking your units`, `${cap(dir)} · ${time}`, gameClock, last);
+    events.threat(by.team, 'units', [t.pos[0], t.pos[2]], `${name} is attacking ${your} units`, `${cap(dir)} · ${time}`, gameClock, last);
   }
 };
 // What happened: text, an icon (or a team's emblem), and where (for the camera).
@@ -3285,7 +3359,7 @@ function lookAt(x, z) {
 }
 // Space: the camera to the crystal under attack, or else the newest threat.
 function goToAlert() {
-  const c = crystalOf('blue');
+  const c = crystalOf(units.player);
   if (crystalEl.classList.contains('alarm') && c) { lookAt(c.pos[0], c.pos[2]); return; }
   const t = events.split(gameClock).threats[0];
   if (t?.at) lookAt(t.at[0], t.at[1]);
@@ -3345,7 +3419,7 @@ spawnPicker.addEventListener('click', (e) => {
   buildSpawnPicker();
 });
 const speedLabel = document.getElementById('speed-label');
-const showSpeed = () => { speedLabel.textContent = `×${GAME_SPEED.speed.toFixed(1)}`; };
+const showSpeed = () => { speedLabel.textContent = speedText(GAME_SPEED.speed); };
 showSpeed();
 
 // Overlays: the pause menu (Esc, or ≡ by the minimap), Controls (F1, or ?), Options and Credits, one over the other;
@@ -3431,12 +3505,12 @@ const CONTROLS = [
     ['Stop a mode', 'Right click ' + kbd('Esc')],
   ]],
   ['The screen', [
-    ['Controls', kbd('F1')], ['Hide the HUD', kbd('F2')], ['Collapse the minimap', kbd('M')], ['Pause menu', kbd('Esc')],
+    ['Controls', kbd('F1')], ['Game speed (0.1 to 1, then 2, 3, 5)', kbd('−', '+')], ['Hide the HUD', kbd('F2')], ['Collapse the minimap', kbd('M')], ['Pause menu', kbd('Esc')],
     ['Developer buttons', kbd('`')], ['Tuning, profiler', kbd('T', 'G')], ['Lighting modes', kbd('Shift') + kbd('+') + kbd('L')],
   ]],
   ['Sandbox', [
     ['Raise, Lower, Flatten', kbd('F3', 'F4', 'F5')], ['Brush size', kbd('[', ']')], ['A unit at the cursor', kbd('N') + ' <small>(the one picked)</small> ' + kbd('Shift') + ' <small>red</small>'],
-    ['Insta-build', kbd('I')], ['Fog of war', kbd('O')], ['Game speed', kbd('−', '+')],
+    ['Insta-build', kbd('I')], ['Fog of war', kbd('O')],
   ]],
 ];
 const HOW = [
@@ -3474,7 +3548,7 @@ function startPossess() {
   selectBox.hidden = true;
   camera.ortho = false;
   document.body.classList.add('possessing');
-  possessBanner.innerHTML = `${teamChip(u.team)}<span>Watching through ${u.team === 'blue' ? 'your' : `${TEAMS[u.team].name}'s`} ${(CLASS_NAMES[u.kind] ?? u.kind).toLowerCase()}'s eyes</span><span class="key">Esc</span><span>goes back</span>`;
+  possessBanner.innerHTML = `${teamChip(u.team)}<span>Watching through ${u.team === units.player ? 'your' : `${TEAMS[u.team].name}'s`} ${(CLASS_NAMES[u.kind] ?? u.kind).toLowerCase()}'s eyes</span><span class="key">Esc</span><span>goes back</span>`;
   possessBanner.hidden = false;
 }
 function endPossess() {
@@ -3521,17 +3595,18 @@ function possessView(dt) {
 // blocks are gone.
 const TRAIN_QUEUE = 5;
 const buildings = { list: [], at: new Map(), selected: null, nextId: 1, wait: 0 }; // at: voxel index -> building
-// quiet: the Keep, there from the start (its torches already lit).
-function finishBuilding({ plan, key, name }, quiet = false) {
-  const b = { id: buildings.nextId++, key, name, plan, team: 'blue', actions: BUILDING_ACTIONS[key] ?? [], queue: [], paid: [], progress: 0, rally: [] };
+// team: whose it is (whoever ordered it); quiet: the Keep, there from the start (its torches already lit).
+function finishBuilding({ plan, key, name, team = units.player }, quiet = false) {
+  const b = { id: buildings.nextId++, key, name, plan, team, actions: BUILDING_ACTIONS[key] ?? [], queue: [], paid: [], progress: 0, rally: [] };
   buildings.list.push(b);
   for (const [x, y, z] of plan.blocks) buildings.at.set(terrain.index(x, y, z), b);
   if (quiet) return;
-  for (const t of plan.torches ?? []) if (torches.fits(t.cell, t.wall) && !torches.at(...t.cell)) order(torches.add(t));
+  for (const t of plan.torches ?? []) if (torches.fits(t.cell, t.wall) && !torches.at(...t.cell)) order(torches.add(t), team);
   for (const t of plan.banners ?? []) banners.add(t); // (hung at once)
   // The Editor: its spawn point put down too, so saving it again keeps it.
   if (mode.name === 'editor' && plan.spawn && spawns.fits(plan.spawn.cell) && !spawns.at(...plan.spawn.cell)) spawns.add(plan.spawn.cell, plan.spawn.dir);
   const mid = [0, 1, 2].map((i) => plan.blocks.reduce((s, c) => s + c[i], 0) / Math.max(1, plan.blocks.length) + 0.5);
+  if (team !== units.player) return; // (the player hears of their own)
   sfx('buildDone', mid);
   logEvent(`${name} built`, ICON.build, [mid[0], mid[2]]);
 }
@@ -3558,21 +3633,21 @@ function bringOut(b, kind, walk = true) {
   // Off along its rally waypoints (attack-moving to those set with Q), or else a few voxels out of the door.
   if (b.rally.length) b.rally.forEach((r, i) => units.order(r.point, r.normal, r.amove, i > 0, [u]));
   else units.order([x + dx * 3 + 0.5, y + 0.5, z + dz * 3 + 0.5], [0, 0, 0], false, false, [u]);
-  if (b.team === 'blue') { sfx('unitReady'); logEvent(`${CLASS_NAMES[kind] ?? kind} trained at the ${b.name}`, UNIT_ICON[kind] ?? ICON.chevron, [x + 0.5, z + 0.5]); }
+  if (b.team === units.player) { sfx('unitReady'); logEvent(`${CLASS_NAMES[kind] ?? kind} trained at the ${b.name}`, UNIT_ICON[kind] ?? ICON.chevron, [x + 0.5, z + 0.5]); }
   return u;
 }
-// A new game's population: the player's villagers (not counting its crystal), and the room its Keep and houses
+// A new game's population: a team's villagers (not counting its crystal or walls), and the room its Keep and houses
 // make for them (see POP_TUNING).
-const population = () => units.list.filter((u) => u.team === 'blue' && !u.dying && u.kind !== 'crystal' && u.kind !== 'wall').length;
-function popRoom() {
+const population = (team) => units.list.filter((u) => u.team === team && !u.dying && u.kind !== 'crystal' && u.kind !== 'wall').length;
+function popRoom(team) {
   let n = 0;
-  for (const b of buildings.list) if (b.team === 'blue') n += b.key === 'keep' ? POP_TUNING.keep : b.key === 'hut' ? POP_TUNING.house : 0;
+  for (const b of buildings.list) if (b.team === team) n += b.key === 'keep' ? POP_TUNING.keep : b.key === 'hut' ? POP_TUNING.house : 0;
   return Math.round(n);
 }
-// Where workers take what they've gathered (see jobs.js Workers.deliver): the player's Keep, or for wheat, the
-// Keep or any house. As { lo, hi } boxes ([x, y, z], hi exclusive) round their blocks.
-function depots(block) {
-  return buildings.list.filter((b) => b.team === 'blue' && (b.key === 'keep' || (block === WHEAT && b.key === 'hut'))).map((b) => planBox(b.plan));
+// Where a team's workers take what they've gathered (see jobs.js Workers.deliver): its Keep, or for wheat, the Keep
+// or any of its houses. As { lo, hi } boxes ([x, y, z], hi exclusive) round their blocks.
+function depots(block, team) {
+  return buildings.list.filter((b) => b.team === team && (b.key === 'keep' || (block === WHEAT && b.key === 'hut'))).map((b) => planBox(b.plan));
 }
 // A rally waypoint where the screen point (x, y) lands: amove, attack-moving to it; queued (Shift), after the others,
 // else instead of them.
@@ -3582,10 +3657,7 @@ function setRally(b, x, y, amove, queued) {
   if (hit) addRally(b, hit, amove, queued);
 }
 function addRally(b, hit, amove, queued) {
-  if (!b.actions.length) return;
-  if (!queued) b.rally = [];
-  b.rally.push({ point: hit.point.slice(), normal: hit.normal.slice(), amove });
-  orderSound(amove ? 'attack' : 'move');
+  issue({ k: 'rally', building: b.id, ...hitOf(hit), amove, queued });
 }
 // The selected building's rally waypoints, as unit-renderer parts: a post with a flag at each (blue for a move, red
 // for an attack-move), joined by a dotted line along the way a unit coming out of its spawn point would walk.
@@ -3655,29 +3727,11 @@ function dotsAlong(cells) {
   }
   return out;
 }
-// Whether a new game's inventory has what training `kind` costs (sandbox: always).
-const canAfford = (kind) => !inventory || trainingCost(kind).every(([blk, n]) => inventory.get(blk) >= n);
+// Whether a new game's inventory (the player's, or team's) has what training `kind` costs (sandbox: always).
+const canAfford = (kind, inv = inventory) => !inv || trainingCost(kind).every(([blk, n]) => inv.get(blk) >= n);
+// A unit trained at b (see the train command; cancelled: untrain, what it cost back in the inventory).
 function trainUnit(b, kind) {
-  if (!b || !b.actions.includes(kind)) return;
-  if (b.queue.length >= TRAIN_QUEUE) { sfx('error'); return; }
-  const cost = inventory ? trainingCost(kind) : [];
-  if (!canAfford(kind)) {
-    const short = cost.filter(([blk, n]) => inventory.get(blk) < n).map(([blk]) => CURRENCY_NAMES[blk]);
-    toast(`Not enough ${short.join(' or ')} for a ${CLASS_NAMES[kind] ?? kind}`);
-    sfx('error');
-    return;
-  }
-  sfx('trainQueue');
-  for (const [blk, n] of cost) inventory.add(blk, -n);
-  b.queue.push(kind);
-  b.paid.push(cost);
-}
-// Cancelled: what it cost goes back into the inventory.
-function cancelTraining(b, i) {
-  if (!b || !b.queue[i]) return;
-  b.queue.splice(i, 1);
-  for (const [blk, n] of b.paid.splice(i, 1)[0] ?? []) inventory?.add(blk, n);
-  if (i === 0) b.progress = 0;
+  if (b) issue({ k: 'train', building: b.id, kind });
 }
 function updateBuildings(dt) {
   for (const b of buildings.list) {
@@ -3685,9 +3739,9 @@ function updateBuildings(dt) {
     const time = Math.max(0, PRODUCTION_TUNING[b.queue[0]] ?? 5);
     b.progress = Math.min(time, b.progress + dt);
     if (b.progress < time) continue;
-    if (inventory && b.team === 'blue' && population() >= popRoom()) { // (housed: no room for another)
-      const box = planBox(b.plan);
-      if (events.warn('housed', `Population full (${population()}/${popRoom()})`, 'Training waits: build more houses', [(box.lo[0] + box.hi[0]) / 2, (box.lo[2] + box.hi[2]) / 2], gameClock)) sfx('error');
+    if (invOf(b.team) && population(b.team) >= popRoom(b.team)) { // (housed: no room for another)
+      const box = planBox(b.plan), pop = population(b.team), room = popRoom(b.team);
+      if (b.team === units.player && events.warn('housed', `Population full (${pop}/${room})`, 'Training waits: build more houses', [(box.lo[0] + box.hi[0]) / 2, (box.lo[2] + box.hi[2]) / 2], gameClock)) sfx('error');
       continue;
     }
     if (!bringOut(b, b.queue[0])) continue;
@@ -3719,9 +3773,7 @@ function patrolOrder(x, y, queued) {
   if (buildings.selected) return;
   const { origin, dir } = rayAt(x, y);
   const hit = terrain.raycast(origin, dir);
-  if (!hit) return;
-  if (units.commandable().length) orderSound('patrol');
-  units.patrol(hit.point, hit.normal, queued);
+  if (hit) issue({ k: 'patrol', units: ids(units.commandable()), ...hitOf(hit), queued });
 }
 
 function attackMove(x, y, queued) {
@@ -3730,9 +3782,7 @@ function attackMove(x, y, queued) {
   if (target && attackOrder(target)) return;
   const { origin, dir } = rayAt(x, y);
   const hit = terrain.raycast(origin, dir);
-  if (!hit) return;
-  if (units.commandable().length) orderSound('attack');
-  units.order(hit.point, hit.normal, true, queued);
+  if (hit) issue({ k: 'move', units: ids(units.commandable()), ...hitOf(hit), amove: true, queued });
 }
 
 // The minimap's clicks (see minimap.js): left click or drag moves the camera; with a command armed (attack-move, patrol,
@@ -3752,9 +3802,8 @@ function mapOrder(cmd, x, z, target, queued) {
     return;
   }
   if (cmd !== 'patrol' && target && attackOrder(target)) { minimap.ping(target.pos[0], target.pos[2], attackCol); return; }
-  orderSound(cmd);
-  if (cmd === 'patrol') units.patrol(hit.point, hit.normal, queued);
-  else units.order(hit.point, hit.normal, cmd === 'attack', queued);
+  const sel = ids(units.commandable());
+  issue(cmd === 'patrol' ? { k: 'patrol', units: sel, ...hit, queued } : { k: 'move', units: sel, ...hit, amove: cmd === 'attack', queued });
   minimap.ping(x, z, cmd === 'move' ? moveCol : attackCol);
 }
 minimap.onLook = (x, z) => {
@@ -3777,6 +3826,240 @@ minimap.onSelect = (list, add) => {
   if (!add || list.length) buildings.selected = null;
   if (list.length) sfx('select');
 };
+
+// Commands (see commands.js): every order a player gives, as plain data, carried out here for the team that gave it.
+// The clicks above make them for units.player and send them through issue(), which says how it went (a toast, a
+// sound); a computer opponent, or another player online, gives its team's the same way (commands.apply).
+const commands = new Commands();
+// The computer opponents (a new game's, see cpu.js), and the game as they see it.
+let cpus = [];
+const cpuGame = {
+  terrain, units, buildings, farms, keeps, teams: GAME_TEAMS,
+  apply: (team, cmd) => commands.apply(team, cmd),
+  clock: () => gameClock,
+  out: (team) => eliminated.has(team),
+  inventory: invOf,
+  population,
+  popRoom,
+  seen: (x, z, team) => !fog.never(x, z, team),
+  visible: (x, z, team) => !fog.hidden(x, z, team),
+  farmCount: (team) => { let n = 0; for (const f of farms.list.values()) if (f.team === team) n++; return n; },
+  // Whether a farm's within gap columns of box ({ lo, hi }).
+  farmIn: (box, gap) => {
+    for (let z = box.lo[2] - gap; z < box.hi[2] + gap; z++) for (let x = box.lo[0] - gap; x < box.hi[0] + gap; x++) if (farms.has(x, z)) return true;
+    return false;
+  },
+};
+const ids = (list) => list.map((u) => u.id);
+// Where a raycast met the ground, as a command's point and normal (plain arrays).
+const hitOf = (hit) => ({ point: [...hit.point], normal: [...hit.normal] });
+const yes = (sound = null) => ({ ok: true, sound });
+const no = (why = null, sound = why ? 'error' : null) => ({ ok: false, why, sound });
+// The units with these ids that team can order: alive, not a crystal or a wall, its own (any team's in the sandbox).
+function unitsOf(team, list) {
+  const want = new Set(list);
+  return units.list.filter((u) => want.has(u.id) && !u.dying && u.kind !== 'crystal' && u.kind !== 'wall' && (!units.controls || u.team === team));
+}
+// The building with this id, if team can give it orders (its own; any in the sandbox).
+const buildingOf = (team, id) => buildings.list.find((b) => b.id === id && !b.gone && (!units.controls || b.team === team)) ?? null;
+// A team's colour in the health bars (its part just lost), linear: selected buildings' and sites' outlines.
+const hotColour = (team) => linearColor(HEALTHBAR_TUNING[`hot${TEAMS[team]?.name ?? 'Blue'}`] ?? HEALTHBAR_TUNING.hotBlue);
+// The player's command: carried out, then a toast if it couldn't be and why, and its sound.
+const ORDER_SOUNDS = new Set(['move', 'attack', 'patrol', 'work']);
+function issue(cmd) {
+  const r = watching ? { ok: false, why: 'You\'re watching: the computer plays every side' } : commands.apply(units.player, cmd);
+  if (r.why) toast(r.why);
+  if (r.sound) (ORDER_SOUNDS.has(r.sound) ? orderSound : sfx)(r.sound);
+  return r;
+}
+// Units sent to a point (attack-moving with amove), at an enemy, on patrol, or held where they are.
+commands.on('move', (team, { units: list, point, normal, amove, queued }) => {
+  const sel = unitsOf(team, list);
+  if (!sel.length) return no();
+  units.order(point, normal, !!amove, !!queued, sel);
+  return yes(amove ? 'attack' : 'move');
+});
+commands.on('attack', (team, { units: list, target: id }) => {
+  const target = units.list.find((u) => u.id === id && !u.dying);
+  // (Its fighters only, of another team than the target's: workers don't fight.)
+  const sel = target ? unitsOf(team, list).filter((u) => u.team !== target.team && u.kind !== 'worker') : [];
+  for (const u of sel) units.attack(u, target, true, true);
+  return sel.length ? yes('attack') : no();
+});
+commands.on('patrol', (team, { units: list, point, normal, queued }) => {
+  const sel = unitsOf(team, list);
+  if (!sel.length) return no();
+  units.patrol(point, normal, !!queued, sel);
+  return yes('patrol');
+});
+commands.on('stop', (team, { units: list }) => {
+  const sel = unitsOf(team, list);
+  if (!sel.length) return no();
+  units.stop(sel);
+  return yes();
+});
+// A worker's Priority (see SPEC_INFO).
+commands.on('spec', (team, { units: list, spec }) => {
+  if (!SPECS.includes(spec)) return no();
+  const sel = unitsOf(team, list).filter((u) => u.kind === 'worker');
+  for (const u of sel) setSpec(u, spec);
+  return sel.length ? yes() : no();
+});
+// Open orders for the team's workers: Mine marks on and off, Fill, Farm, a Wall line, a building, a torch, a portcullis.
+commands.on('mine', (team, { voxels, veins }) => { mineFor(team, voxels, !!veins); return yes('work'); });
+commands.on('unmine', (team, { voxels, veins }) => { unmarkMine(veins ? withVeins(voxels) : voxels, team); return yes('toggleOff'); });
+commands.on('fill', (team, { voxels, block }) => {
+  if (!PALETTE.some((p) => p.block === block)) return no();
+  sculptMark(voxels, true, block, true, team);
+  return yes('work');
+});
+commands.on('farm', (team, { cells }) => {
+  const ok = cells.filter((c) => farms.farmable(...c) && !farms.has(c[0], c[2]));
+  if (!ok.length) return no();
+  farms.mark(ok, team, insta.on);
+  farms.update(0, units.crews);
+  return yes('work');
+});
+commands.on('wall', (team, { a, b, y, block }) => {
+  const blk = wallBlock(block);
+  if (!blk) return no('Walls are built of planks or bricks');
+  const P = wallPlan({ a, b, y }, team);
+  if (!P.cols.length) return no();
+  sculptMark(walls.order(P.cols, blk, team, P.out), true, blk, true, team);
+  return yes('work');
+});
+// A building, its floor at cell, turned to facing (see buildAt). What it costs on top of its blocks (the Stables'
+// gold) is paid as it's placed, and given back if it's called off before it's built.
+commands.on('build', (team, { key, cell: [x, y0, z], facing }) => {
+  const B = Object.hasOwn(BUILDINGS, key) ? BUILDINGS[key] : null;
+  if (!B || (key === 'keep' && mode.name !== 'editor')) return no();
+  const plan = B.plan(x, y0, z, facing);
+  if (!canPlace(terrain, plan, y0, allJobs()) || !canExit(terrain, plan)) return no();
+  const inv = invOf(team), extra = inv ? buildExtra(key) : [], short = extra.filter(([blk, n]) => inv.get(blk) < n);
+  if (short.length) return no(`Not enough ${short.map(([blk]) => CURRENCY_NAMES[blk]).join(' or ')} for the ${B.name}`);
+  const job = new BuildJob(terrain, plan), name = B.name;
+  Object.assign(job, { key, name, siteId: ++siteIds }); // (selectable while it's built: see siteAt)
+  for (const [blk, n] of extra) inv.add(blk, -n);
+  if (extra.length) job.cancel = () => { if (!job.done) for (const [blk, n] of extra) inv.add(blk, n); };
+  // Once it's built: a building to select, its torches to be set (after the units' update, see finishBuilding).
+  job.onDone = () => finishedPlans.push({ plan, key, name, team });
+  order(job, team);
+  return yes('work');
+});
+commands.on('torch', (team, hit) => {
+  const p = torches.placement(hit);
+  if (!p?.fits) return no();
+  order(torches.add(p), team);
+  return yes('work');
+});
+// A portcullis: in two sections of the team's own built wall (the one clicked and the next along it, on the side
+// clicked nearer), its iron paid now (given back if it's called off before it's made).
+const GATE_WHERE = 'Click a section of your own wall to put a portcullis in it';
+commands.on('gate', (team, hit) => {
+  const p = gates.placement(hit, team), inv = invOf(team), n = inv ? Math.round(GATE_TUNING.iron) : 0;
+  if (!p) return no(GATE_WHERE);
+  if (!p.fits) {
+    return no({ enemy: 'That wall isn\'t yours', unbuilt: 'That wall isn\'t finished yet', used: 'That wall can\'t take a portcullis (one\'s there already, or it\'s too low)',
+      straight: 'A portcullis needs two sections of wall side by side in a straight line, on the same level' }[p.why] ?? 'A portcullis can\'t go there');
+  }
+  if (n > 0 && inv.get(BLOCK.IRON) < n) return no(`Not enough iron for a portcullis (${n})`);
+  const job = gates.add(p, team), g = job.gate, base = job.cancel.bind(job);
+  // (A banner hung down over its opening comes down: the wall's own, or one hung on it in the Editor.)
+  for (const s of p.tiles) s.banner = false;
+  banners.list = banners.list.filter((b) => !p.tiles.some((s) => b.cell[0] - b.wall[0] === s.x && b.cell[2] - b.wall[1] === s.z));
+  if (n > 0) {
+    inv.add(BLOCK.IRON, -n);
+    job.cancel = () => { if (!g.built) inv.add(BLOCK.IRON, n); base(); };
+  }
+  job.onMade = gateMade;
+  order(job, team);
+  return yes('work');
+});
+// Delete: the team's open order at the point called off: its farms or its Mine or Fill marks within the brush
+// (radius), or the whole of anything else (a building, a torch, a portcullis, a box to flatten).
+commands.on('clear', (team, { point, normal, radius }) => {
+  const crew = units.crew(team), { sculpt, mines } = sideOf(team);
+  const x = clamp(Math.floor(point[0]), 0, SIZE[0] - 1), z = clamp(Math.floor(point[2]), 0, SIZE[2] - 1);
+  const x0 = x - Math.floor((radius - 1) / 2), z0 = z - Math.floor((radius - 1) / 2);
+  if (farms.has(x, z, team)) { farms.unmark(x0, z0, x0 + radius, z0 + radius, team); return yes(); }
+  const job = crew.jobs.find((j) => j.contains(x, z));
+  if (!job) return no();
+  if (job === sculpt) sculpt.unmark({ point, normal }, radius); // just the marks under the brush
+  else if (job === mines) mines.unmark(x0, z0, x0 + radius, z0 + radius);
+  else crew.cancel(job);
+  return yes();
+});
+// A building's: a unit trained (paid now), one in its queue called off (what it cost back), its rally waypoints.
+commands.on('train', (team, { building, kind }) => {
+  const b = buildingOf(team, building);
+  if (!b || !b.actions.includes(kind)) return no();
+  if (b.queue.length >= TRAIN_QUEUE) return no(null, 'error');
+  const inv = invOf(b.team), cost = inv ? trainingCost(kind) : [];
+  if (!canAfford(kind, inv)) return no(`Not enough ${cost.filter(([blk, n]) => inv.get(blk) < n).map(([blk]) => CURRENCY_NAMES[blk]).join(' or ')} for a ${CLASS_NAMES[kind] ?? kind}`);
+  for (const [blk, n] of cost) inv.add(blk, -n);
+  b.queue.push(kind);
+  b.paid.push(cost);
+  return yes('trainQueue');
+});
+commands.on('untrain', (team, { building, index }) => {
+  const b = buildingOf(team, building);
+  if (!b?.queue[index]) return no();
+  b.queue.splice(index, 1);
+  for (const [blk, n] of b.paid.splice(index, 1)[0] ?? []) invOf(b.team)?.add(blk, n);
+  if (index === 0) b.progress = 0;
+  return yes();
+});
+// A rally waypoint: amove, attack-moving to it; queued (Shift), after the others, else instead of them.
+commands.on('rally', (team, { building, point, normal, amove, queued }) => {
+  const b = buildingOf(team, building);
+  if (!b?.actions.length) return no();
+  if (!queued) b.rally = [];
+  b.rally.push({ point, normal, amove: !!amove });
+  return yes(amove ? 'attack' : 'move');
+});
+commands.on('unrally', (team, { building }) => {
+  const b = buildingOf(team, building);
+  if (!b) return no();
+  b.rally = [];
+  return yes('toggleOff');
+});
+
+// Who the person at this screen plays: whose villagers the clicks order, whose inventory and population the HUD shows,
+// whose fog of war and whose sounds (the New game's units.player; F9, the test key, switches between its teams).
+function playAs(team) {
+  units.player = team;
+  if (mode.name === 'new') units.controls = watching ? 'none' : team; // (orders for that team's villagers only; none watching)
+  for (const u of units.list) u.selected = false;
+  buildings.selected = null;
+  site = null;
+  arm(null);
+  if (inventory) inventory.onChange = inventory.onShare = null;
+  inventory = invOf(team);
+  if (inventory) {
+    inventory.onChange = showCounts;
+    inventory.onShare = showCosts;
+  }
+  audio.player = team;
+  unitRenderer.player = team;
+  for (const b of fog.setPlayer(team)) shown(b.lo, b.hi, true); // (what the last team's fog held back)
+  if (fog.on) blankOn = null; // (and the ground made again for what this team's never seen: see syncBlank)
+  const keep = keeps.get(team), box = keep && planBox(keep);
+  if (box) {
+    camera.target[0] = (box.lo[0] + box.hi[0]) / 2;
+    camera.target[2] = (box.lo[2] + box.hi[2]) / 2;
+  }
+  showCounts();
+  showCosts();
+  dockKey = '';
+}
+// F9 (a New game with opponents): the next team's turn at this screen, to try each side's economy and orders.
+function switchTeam() {
+  if (mode.name !== 'new' || GAME_TEAMS.length < 2) return;
+  const team = GAME_TEAMS[(GAME_TEAMS.indexOf(units.player) + 1) % GAME_TEAMS.length];
+  playAs(team);
+  toast(`Playing as ${TEAMS[team].name}`, 2);
+  sfx('toggleOn');
+}
 
 function spawnAtCursor(team = 'blue', kind = 'worker') {
   const hit = pick(camera.matrices().invViewProj);
@@ -3846,15 +4129,61 @@ function resize() {
   post.resize(w, h, renderer.depth);
 }
 
+// The game's time step this frame: none while paused (an overlay open), slow motion or fast forward in the sandbox and
+// a New game (see GAME_SPEED, stepGameSpeed).
+const gameSpeed = () => (paused() ? 0 : speedKeys() ? clamp(GAME_SPEED.speed, 0.1, FAST_SPEEDS.at(-1)) : 1);
+// The game moved on dt seconds, in steps of at most 0.1 s (so fast forward moves things on as far each step as a slow
+// frame would; a paused game's still stepped, by 0).
+function stepBy(dt) {
+  do step(Math.min(0.1, dt)); while ((dt -= 0.1) > 1e-6);
+}
+// One step of the game, dt seconds on (the same whether it's drawn after or not, see frame and the timer below): the
+// villagers, what each team sees, buildings and their training, farms, walls and gates, the inventories, what falls
+// and the leaves withering. Nothing here draws; what it changes of the ground goes to shown (the meshes) as before.
+function step(dt) {
+  gameClock += dt;
+  units.update(dt);
+  // Fog of war: what each team sees now; the edits held back that the player sees now shown (and, never seen not
+  // drawn, the tiles they've just seen for the first time).
+  for (const b of fog.update(dt, units.list, buildings.list, sightOf, buildingSightOf)) shown(b.lo, b.hi, true);
+  for (const f of finishedPlans.splice(0)) finishBuilding(f);
+  updateBuildings(dt);
+  farms.update(dt, units.crews); // the wheat growing, and the farms' work for each team's workers
+  walls.update(dt, toFill); // (sections finished, orders dropped)
+  gates.check(); // (a gate goes with its wall)
+  for (const g of gates.update(dt, units.list)) { // (raised for its team's units, with a rattle)
+    const at = [g.x + 0.5 + g.along[0] * 0.5, g.y0 + 1, g.z + 0.5 + g.along[1] * 0.5];
+    if (!fog.hidden(at[0], at[2])) sfx('gate', at);
+  }
+  for (const crew of units.crews.values()) crew.inventory?.update(dt);
+  if (dt > 0) { // (paused: nothing falls)
+    debris.tick(dt);
+    felling.tick(dt);
+    collapse.update(dt);
+  }
+  scorch.update(dt);
+  for (const cpu of cpus) cpu.update(dt); // the computer's teams
+  for (const c of leafDecay.update(dt)) {
+    sfx('leaves', [0, 1, 2].map((i) => (c.lo[i] + c.hi[i]) / 2));
+    for (const b of fog.defer(c.lo, c.hi)) shown(b.lo, b.hi);
+  }
+}
+// A hidden tab gets no frames: with GAME_SPEED.background on, a game goes on from this timer instead, in steps of at
+// most 0.1 s, catching up on at most a second each time (the browser slows timers in hidden tabs).
+setInterval(() => {
+  if (!document.hidden || !mode.name || GAME_SPEED.background < 0.5) return;
+  const now = performance.now();
+  const t = Math.min(1, (now - last) / 1000) * gameSpeed();
+  last = now;
+  if (t > 1e-6) stepBy(t);
+}, 50);
+
 function frame(now) {
   const frameStart = performance.now();
   profiler.lap(null);
   // The game's time step (slowed in slow motion, see GAME_SPEED) and the camera's, always real.
   const realDt = Math.min(0.1, (now - last) / 1000);
-  const speed = paused() ? 0 : mode.name === 'sandbox' ? clamp(GAME_SPEED.speed, 0.1, 1) : 1;
-  const dt = realDt * speed;
-  gameClock += dt;
-  const clock = gameClock;
+  const speed = gameSpeed(), dt = realDt * speed;
   last = now;
   lastRealDt = realDt;
   resize();
@@ -3871,29 +4200,18 @@ function frame(now) {
   brush.hit = hit;
   profiler.lap(null);
   if (!mode.name) camera.orbit(realDt * MENU_TUNING.spin, 0); // the world turning behind the main menu
-  units.update(dt);
-  groups.update();
-  // Fog of war: what each team sees now; the edits held back that the player sees now shown (and, never seen not
-  // drawn, the tiles they've just seen for the first time); other teams' villagers where the player can't see hidden
-  // (and dropped from the selection).
   syncBlank();
-  for (const b of fog.update(dt, units.list, buildings.list, sightOf, buildingSightOf)) shown(b.lo, b.hi, true);
+  stepBy(dt);
+  profiler.lap('game steps (units, computer, fog...)');
+  const clock = gameClock;
+  groups.update();
+  // Other teams' villagers where the player can't see hidden (and dropped from the selection).
   for (const u of units.list) {
     const at = u.rag ? u.rag.pos : u.pos;
     u.hidden = fog.on && u.team !== fog.player && fog.hidden(at[0], at[2]);
     if (u.hidden) u.selected = false;
   }
   const seenUnits = fog.on ? units.list.filter((u) => !u.hidden) : units.list;
-  for (const f of finishedPlans.splice(0)) finishBuilding(f);
-  updateBuildings(dt);
-  farms.update(dt, units.workers); // the wheat growing, and the farms' work for the workers
-  walls.update(dt, (x, y, z) => units.workers.toFill(x, y, z)); // (sections finished, orders dropped)
-  gates.check(); // (a gate goes with its wall)
-  for (const g of gates.update(dt, units.list)) { // (raised for its team's units, with a rattle)
-    const at = [g.x + 0.5 + g.along[0] * 0.5, g.y0 + 1, g.z + 0.5 + g.along[1] * 0.5];
-    if (!fog.hidden(at[0], at[2])) sfx('gate', at);
-  }
-  inventory?.update(dt);
   // The HUD: the mode bar's hint for a box being drawn, the dock, the ribbon, the crystals, events and idle workers.
   workHint = flatten.drawing ? `Flatten to height ${flatten.drawing.level}. The wheel changes it.`
     : wall.drawing?.stage === 'width' ? 'Move to stretch the line sideways, then click for its height. Esc cancels.'
@@ -3907,24 +4225,15 @@ function frame(now) {
   puffs.update(dt);
   splashes.update(dt);
   grass.tick(dt); // lost tufts' blades fluttering down
-  if (dt > 0) { // (paused: nothing falls)
-    debris.tick(dt);
-    felling.tick(dt);
-    collapse.update(dt);
-  }
-  scorch.update(dt);
   bars.update(seenUnits, dt);
   strength.update(units.list.filter((u) => u.kind !== 'crystal' && u.kind !== 'wall'), dt);
   minimap.update(dt, mode.name ? seenUnits.filter((u) => u.kind !== 'wall') : [], fog.on ? buildings.list.filter((b) => b.team === fog.player || b.seen) : buildings.list, buildings.selected);
-  for (const c of leafDecay.update(dt)) {
-    sfx('leaves', [0, 1, 2].map((i) => (c.lo[i] + c.hi[i]) / 2));
-    for (const b of fog.defer(c.lo, c.hi)) shown(b.lo, b.hi);
-  }
   // Torches: lit as the sun goes down past TORCH_TUNING.sunBelow; the flames nearest the camera's target light the
   // ground (as marks) and the villagers.
   const sunDeg = Math.asin(Math.max(-1, Math.min(1, sky.sun[1]))) * 180 / Math.PI;
   const torchLit = 1 - smooth(TORCH_TUNING.sunBelow - 2, TORCH_TUNING.sunBelow + 2, sunDeg);
-  const parts = units.parts(torchLit);
+  // (posed only on screen, the small ones every other frame: not while looking out through a unit's eyes)
+  const parts = units.parts(torchLit, POSE_TUNING.cull > 0.5 && !possess.unit ? { viewProj: m.viewProj, height: renderer.size[1] } : null);
   const teamColour = (team) => TEAMS[team].toga;
   crystalParts(units, clock, teamColour, parts); // the power crystals (their beams: see beams.draw)
   const glows = crystalLights(units, clock, teamColour).map(([x, y, z, r, ...c]) => [x, y, z, r, ...c.map((v) => v * sky.exposure)]);
@@ -3964,7 +4273,7 @@ function frame(now) {
     .sort((a, b) => a[1] - b[1]).slice(0, MAX_TORCH_LIGHTS).map(([f]) => f);
   const torch = [...linearColor(TORCH_TUNING.color).map((c) => c * TORCH_TUNING.strength * sky.exposure), TORCH_TUNING.radius];
   frameSounds(m, speed, torchLit, [...units.torches, ...placed.flames]);
-  profiler.lap('units (move + pose)');
+  profiler.lap('units pose + HUD');
 
   const add = (brush.tool === 'raise') !== (keys.has('ShiftLeft') || keys.has('ShiftRight'));
   const ghost = brush.tool === 'build' ? buildAt(hit) : null;
@@ -4015,11 +4324,11 @@ function frame(now) {
     eye: m.eye, ahead: [-m.view[2], -m.view[6], -m.view[10]], ortho: camera.ortho, pixel, size: renderer.size,
   }, profiler);
   // Ghost cubes: the marked ground still to do, and what the Raise/Lower brush would mark here.
-  const ghosts = torches.ghosts(sculpt.ghosts()); // (open orders show whatever the tool)
+  const side = sideOf(units.player), ghosts = torches.ghosts(side.sculpt.ghosts()); // (open orders show whatever the tool)
   for (const g of ghosts) if (g[3] === 1 && walls.at(g[0], g[1], g[2])?.built === false) g[3] = 16; // (a wall's: built, the team's colour)
-  mines.ghosts(ghosts); // the open Mine orders
+  side.mines.ghosts(ghosts); // the open Mine orders
   gates.ghosts(ghosts); // and portcullises still to make
-  farms.ghosts(ghosts); // and Farm's still to till
+  farms.ghosts(ghosts, units.player); // and Farm's still to till
   units.workers.buildGhosts(ghosts); // and the buildings' blocks still to place
   // A building being placed: its blocks, in the team's colour where it fits (white past the inventory, red where not).
   if (ghost) planGhosts(ghost.plan, ghost.fits ? (ghost.short ? 7 : 14) : 15, ghosts);
@@ -4052,7 +4361,7 @@ function frame(now) {
     const p = torches.placement(hit);
     if (p) ghosts.push(torches.preview(p));
   } else if (brush.tool === 'build' && build.item === 'portcullis') { // (white when the iron's short)
-    const p = gates.placement(hit, 'blue');
+    const p = gates.placement(hit, units.player);
     if (p) gates.preview(p, !!inventory && inventory.get(BLOCK.IRON) < Math.round(GATE_TUNING.iron), ghosts);
   } else if (brush.tool === 'build' && BANNER_ITEMS[build.item]) {
     const p = banners.placement(hit, BANNER_ITEMS[build.item]);
@@ -4087,10 +4396,10 @@ function frame(now) {
   haze.draw(encoder, colorView, renderer.gbuf, renderer.depth, m.invViewProj, camera.ortho, fogStart);
   if (buildings.selected) { // its silhouette, in its team's colour, as wide as a selected villager's outline
     buildingOutlines.draw(encoder, colorView, renderer.gbuf, renderer.depth, m.viewProj, m.invViewProj,
-      standingBlocks(buildings.selected), linearColor(HEALTHBAR_TUNING.hotBlue), SELECT_TUNING.outline, profiler);
+      standingBlocks(buildings.selected), hotColour(buildings.selected.team), SELECT_TUNING.outline, profiler);
   } else if (site && !site.done) { // one being built: all of it, white while the inventory can't cover it
     buildingOutlines.draw(encoder, colorView, renderer.gbuf, renderer.depth, m.viewProj, m.invViewProj,
-      site.plan.blocks, site.short ? [1, 1, 1] : linearColor(HEALTHBAR_TUNING.hotBlue), SELECT_TUNING.outline, profiler);
+      site.plan.blocks, site.short ? [1, 1, 1] : hotColour(units.player), SELECT_TUNING.outline, profiler);
   }
   profiler.lap('encode terrain + units');
   if (mode.name !== 'editor') { // (the editor has no water)
@@ -4165,4 +4474,4 @@ menu.querySelector('.menu-note').textContent = '';
 if (setup.start) startGame('new');
 
 // For poking at from the console.
-window.game = { terrain, field, camera, brush, minimap, fog, device, profiler, units, water, sky, mode, buildings, events, worldInfo, splashes, get inventory() { return inventory; } };
+window.game = { terrain, field, camera, brush, minimap, fog, device, profiler, units, water, sky, mode, buildings, events, worldInfo, splashes, commands, issue, playAs, step, get cpus() { return cpus; }, cpuGame, get inventory() { return inventory; } };

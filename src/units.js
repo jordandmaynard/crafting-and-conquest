@@ -5,8 +5,8 @@
 // both cells beside the diagonal leave it room to pass), and hop down a drop of up to maxDrop straight ahead. Paths come from A* over those cells, so they follow
 // overhangs and tunnels as well as the surface. They stay out of the water, and don't collide with each other.
 
-import { SIZE, BLOCK, WATER_LEVEL } from './terrain.js';
-import { Workers, toolFor, workTime } from './jobs.js';
+import { SIZE, BLOCK, WATER_LEVEL, SOLID_MIN } from './terrain.js';
+import { Workers, WORK_TUNING, toolFor, workTime } from './jobs.js';
 import { linearColor } from './sky.js';
 import { Ragdoll, RAGDOLL_TUNING } from './ragdoll.js';
 import { POSSESS_TUNING } from './camera.js';
@@ -24,6 +24,8 @@ export const UNIT_TUNING = {
   knightSpeed: 4.8, scoutSpeed: 6.4, // (mounted: a knight 1.5 times a warrior's, a scout twice an archer's)
   climbSpeed: 6,       // voxels per second when stepping up or down
   maxExpanded: 60000,  // A* gives up (and goes as near as it got) after expanding this many cells
+  orderPathMs: 3,      // milliseconds a frame for units' paths where they're sent (spread over frames, see runPaths)
+  joinSearch: 1500,    // cells a unit sent with others may search to join its leader's path (else it searches its own)
   repathDelay: 0.25,   // seconds after an edit blocks the path before looking for a new one
   maxDrop: 3,          // voxels it can hop down (not climb back up)
   dropSpeed: 14,       // voxels per second falling
@@ -42,6 +44,22 @@ export const TORCH_TUNING = {
 const [X, Y, Z] = SIZE;
 const key = (x, y, z) => x + X * (z + Z * y);
 const unkey = (k) => [k % X, Math.floor(k / (X * Z)), Math.floor(k / X) % Z];
+// Every path search's working space (see findPath): its cells (made when first searched, see PathTable), its heap, and
+// the steps from one cell (expand's).
+let searchTable = null, pathTable = null; // (findPath's, and runPaths' that last over frames)
+const STEPS = new Float64Array(4 * 40);
+// terrain.solid and Units.standable for expand, on the voxels it's looking at (VOX) and with another team's gates shut
+// (GATE, see gates.js) for the gate* ones: inlined, as they run for every cell a search looks at.
+let VOX = null, GATE = null;
+const LOW = Math.max(1, WATER_LEVEL);
+const voxSolid = (a, b, c) => (a < 0 || c < 0 || b >= Y || a >= X || c >= Z ? false : b < 0 || VOX[a + X * (b + Y * c)] >= SOLID_MIN);
+function voxStand(a, b, c) {
+  if (a < 0 || c < 0 || a >= X || c >= Z || b < LOW || b >= Y) return false;
+  const i = a + X * (b + Y * c), below = VOX[i - X]; // (terrain.index's order: x, then y, then z)
+  return below >= SOLID_MIN && below !== BLOCK.OBSIDIAN && VOX[i] < SOLID_MIN && (b + 1 >= Y || VOX[i + X] < SOLID_MIN);
+}
+const gateSolid = (a, b, c) => voxSolid(a, b, c) || GATE(a, b, c);
+const gateStand = (a, b, c) => voxStand(a, b, c) && !GATE(a, b, c) && !GATE(a, b + 1, c);
 
 // Villagers come in classes (CLASSES): a worker takes on building jobs, with the tool for each, and never fights, even
 // when attacked; a warrior always has its sword in hand, never takes on jobs, and goes for the nearest enemy within
@@ -199,6 +217,11 @@ function winceOf(u) {
 // body the way it knocks them, and their arms out; workers lean and twist into their work, and spearmen, mages and
 // priests into a throw, cast or heal; a whirling barbarian leans out against its spin and staggers after; and a priest
 // prays a moment, its staff raised, before its heal goes out.
+// Posing only what's on screen (see parts, given the view): a unit wholly off screen (a ball of cullRadius voxels round
+// its middle outside the view) isn't posed or drawn; one drawn under halfBelow pixels tall is posed every other frame
+// (the frames between show it as it was). cull 0: everything every frame.
+export const POSE_TUNING = { cull: 1, cullRadius: 3, halfBelow: 24 };
+
 export const ANIM_TUNING = {
   walkLean: 0.07,    // radians the upper body leans forward walking
   walkTwist: 0.1,    // radians it turns against each stride (shoulders against hips)
@@ -833,8 +856,11 @@ export class Units {
     this.possessed = null; // the unit the camera's in (see parts)
     this.hideBody = false;
     this.controls = null; // the team the player gives orders to (a new game), or null for any (see commandable)
-    this.workers = new Workers(this); // flatten jobs
+    this.player = 'blue'; // the team played from this screen: whose orders, inventory and view the HUD shows
+    // Each team's workers (jobs.js Workers): its own open orders, inventory and piles.
+    this.crews = new Map(Object.keys(TEAMS).map((team) => [team, new Workers(this, team)]));
     this.ladders = new Ladders(terrain); // what workers climb (see ladders.js)
+    this.pathQueue = []; // units' paths still to be searched for, in turn (see runPaths)
     this.onEdit = null; // (lo, hi) => void, called after a villager digs or fills a voxel
     this.arrows = [];   // in flight (arrows, spears and fireballs, see loose): { what, from, by, target, aim, t, time, to (a
                         // miss: where it lands) }
@@ -848,6 +874,11 @@ export class Units {
     this.hiddenAt = null; // (x, z) => bool: the player can't see there (fog of war): no arrows, fireballs or blasts drawn
                           // there; each villager's u.hidden is set by main, and a hidden one isn't drawn or picked
   }
+
+  // A team's workers (its Workers).
+  crew(team) { return this.crews.get(team) ?? this.crews.get('blue'); }
+  // The player's workers (see player).
+  get workers() { return this.crew(this.player); }
 
   // Where to draw a unit's feet: its own (eased) height.
   drawHeight(u) { return u.pos[1]; }
@@ -961,90 +992,142 @@ export class Units {
   // off sideways, not on the slant, and doesn't hop down. team: the unit's, which can't pass another team's gate (see
   // gates.js: its opening's as good as wall to it); none, every gate's open.
   *neighbours(x, y, z, climb = false, team = null) {
-    const ter = this.terrain, gate = team && this.gates?.blocker(team);
-    const solid = gate ? (a, b, c) => ter.solid(a, b, c) || gate(a, b, c) : (a, b, c) => ter.solid(a, b, c);
-    const stand = gate ? (a, b, c) => this.standable(a, b, c) && !gate(a, b, c) && !gate(a, b + 1, c) : (a, b, c) => this.standable(a, b, c);
-    const hanging = climb && !this.standable(x, y, z);
+    const n = this.expand(x, y, z, climb, team), out = STEPS.slice(0, n * 4); // (a copy: STEPS is used again)
+    for (let i = 0; i < n; i++) yield [out[i * 4], out[i * 4 + 1], out[i * 4 + 2], out[i * 4 + 3]];
+  }
+  // The same, written into STEPS as (x, y, z, cost) fours: how many (findPath's, with nothing made per step).
+  expand(x, y, z, climb = false, team = null) {
+    VOX = this.terrain.voxels;
+    const gate = team && this.gates?.blocker(team);
+    GATE = gate || null;
+    const solid = gate ? gateSolid : voxSolid, stand = gate ? gateStand : voxStand, out = STEPS;
+    let n = 0;
+    const hanging = climb && !voxStand(x, y, z);
     if (climb) {
-      if (this.onLadder(x, y + 1, z) && !solid(x, y + 2, z)) yield [x, y + 1, z, 1.5];
-      if (this.onLadder(x, y - 1, z) || (hanging && this.standable(x, y - 1, z))) yield [x, y - 1, z, 1.2];
+      if (this.onLadder(x, y + 1, z) && !solid(x, y + 2, z)) { out[0] = x; out[1] = y + 1; out[2] = z; out[3] = 1.5; n++; }
+      if (this.onLadder(x, y - 1, z) || (hanging && voxStand(x, y - 1, z))) { out[n * 4] = x; out[n * 4 + 1] = y - 1; out[n * 4 + 2] = z; out[n * 4 + 3] = 1.2; n++; }
     }
+    const maxDrop = UNIT_TUNING.maxDrop;
     for (let dz = -1; dz <= 1; dz++) {
       for (let dx = -1; dx <= 1; dx++) {
         if (!dx && !dz) continue;
-        const nx = x + dx, nz = z + dz;
-        if (hanging && dx && dz) continue;
+        const nx = x + dx, nz = z + dz, diag = dx !== 0 && dz !== 0;
+        if (hanging && diag) continue;
         for (let dy = -1; dy <= 1; dy++) {
           const ny = y + dy;
+          let cost = -1;
           if (!stand(nx, ny, nz)) {
             // (onto a ladder, straight across from beside it: not past a corner)
-            if (climb && !(dx && dz) && this.onLadder(nx, ny, nz) && !(dy > 0 && solid(x, y + 2, z)) && !(dy < 0 && solid(nx, y + 1, nz))) {
-              yield [nx, ny, nz, 1.5];
+            if (climb && !diag && this.onLadder(nx, ny, nz) && !(dy > 0 && solid(x, y + 2, z)) && !(dy < 0 && solid(nx, y + 1, nz))) cost = 1.5;
+          } else if (!(dy > 0 && solid(x, y + 2, z)) && !(dy < 0 && solid(nx, y + 1, nz))) {
+            // (Stepping up needs headroom above where it starts; stepping down, above where it lands.)
+            cost = (diag ? Math.SQRT2 : 1) + (dy > 0 ? 0.4 : 0);
+            if (diag) {
+              // A diagonal cuts past the two cells beside it: both need room for the body at the higher height.
+              const top = Math.max(y, ny);
+              if (solid(x + dx, top, z) || solid(x + dx, top + 1, z) || solid(x, top, z + dz) || solid(x, top + 1, z + dz)) cost = -1;
+              else if (!solid(x + dx, top - 1, z) && !solid(x, top - 1, z + dz)) cost = -1; // no walking over a hole's corner
             }
-            continue;
           }
-          // Stepping up needs headroom above where it starts; stepping down, above where it lands.
-          if (dy > 0 && solid(x, y + 2, z)) continue;
-          if (dy < 0 && solid(nx, y + 1, nz)) continue;
-          if (dx && dz) {
-            // A diagonal cuts past the two cells beside it: both need room for the body at the higher height.
-            const top = Math.max(y, ny);
-            if (solid(x + dx, top, z) || solid(x + dx, top + 1, z) || solid(x, top, z + dz) || solid(x, top + 1, z + dz)) continue;
-            if (!solid(x + dx, top - 1, z) && !solid(x, top - 1, z + dz)) continue; // no walking over a hole's corner
-          }
-          yield [nx, ny, nz, (dx && dz ? Math.SQRT2 : 1) + (dy > 0 ? 0.4 : 0)];
+          if (cost >= 0) { out[n * 4] = nx; out[n * 4 + 1] = ny; out[n * 4 + 2] = nz; out[n * 4 + 3] = cost; n++; }
         }
         // Hopping down off a ledge, straight ahead only: the column it drops through must be clear.
-        if (dx && dz || hanging) continue;
+        if (diag || hanging) continue;
         if (solid(nx, y, nz) || solid(nx, y + 1, nz)) continue;
-        for (let drop = 2; drop <= UNIT_TUNING.maxDrop; drop++) {
+        for (let drop = 2; drop <= maxDrop; drop++) {
           const ny = y - drop;
           if (solid(nx, ny + 1, nz)) break; // landed higher up already (that's the one-step move above)
-          if (stand(nx, ny, nz)) { yield [nx, ny, nz, 1 + 0.3 * drop]; break; }
+          if (stand(nx, ny, nz)) { out[n * 4] = nx; out[n * 4 + 1] = ny; out[n * 4 + 2] = nz; out[n * 4 + 3] = 1 + 0.3 * drop; n++; break; }
         }
       }
     }
+    return n;
   }
 
   // A* from a cell to a goal cell. Returns the cells after the start, up to the goal or, if it can't be reached,
   // the reachable cell nearest it.
   // climb: a worker's, up and down ladders (see climbs). team: its team's (another team's gates are shut to it).
-  findPath(start, goal, maxExpanded = UNIT_TUNING.maxExpanded, climb = false, team = null) {
-    const h = (x, y, z) => {
-      const dx = Math.abs(x - goal[0]), dz = Math.abs(z - goal[2]);
-      return Math.max(dx, dz) + (Math.SQRT2 - 1) * Math.min(dx, dz) + Math.abs(y - goal[1]) * 0.5;
-    };
-    const startK = key(...start), goalK = key(...goal);
-    const g = new Map([[startK, 0]]);
-    const from = new Map();
-    const heap = new MinHeap();
-    heap.push(h(...start), startK);
-    let best = startK, bestH = h(...start), expanded = 0;
-    const closed = new Set();
-    while (heap.size && expanded < maxExpanded) {
-      const k = heap.pop();
-      if (closed.has(k)) continue;
-      closed.add(k);
-      expanded++;
-      if (k === goalK) { best = k; break; }
-      const [x, y, z] = unkey(k);
-      const hk = h(x, y, z);
-      if (hk < bestH) { bestH = hk; best = k; }
-      const gk = g.get(k);
-      for (const [nx, ny, nz, cost] of this.neighbours(x, y, z, climb, team)) {
-        const nk = key(nx, ny, nz);
-        if (closed.has(nk)) continue;
-        const ng = gk + cost;
-        if (ng < (g.get(nk) ?? Infinity)) {
-          g.set(nk, ng);
-          from.set(nk, k);
-          heap.push(ng + h(nx, ny, nz), nk);
-        }
+  // deadline: a performance.now() past which it stops where it's got to (as if it couldn't get there).
+  findPath(start, goal, maxExpanded = UNIT_TUNING.maxExpanded, climb = false, team = null, deadline = Infinity) {
+    const s = new PathSearch(this, (searchTable ??= new PathTable()), start, goal, maxExpanded, climb, team);
+    this.searchTimedOut = !s.run(deadline); // (stopped for time, not because there's no way)
+    if (this.searchTimedOut) s.finish();
+    return s.path();
+  }
+  // Where expand writes its steps (x, y, z, cost fours).
+  get steps() { return STEPS; }
+
+  // Units' paths searched for over a few frames (see requestPath): one at a time, in order, each frame's share of
+  // its path searches' time (paths: { deadline, n }, as Workers.update's) at most, so a unit ordered far or many at
+  // once can't stall a frame. A group ordered together (see order) waits for its leader's path, then each of the
+  // others joins it (see joinPath) rather than searching all the way itself.
+  runPaths(paths) {
+    const Q = this.pathQueue;
+    while (Q.length) {
+      const req = Q[0], u = req.u;
+      if (u.pathReq !== req || u.dying) { Q.shift(); continue; } // (sent elsewhere since, or fallen)
+      if (paths.n > 0 && performance.now() >= paths.deadline) return;
+      paths.n++;
+      const G = req.group;
+      if (G && !G.path && G.leader !== req && G.leader?.u.pathReq !== G.leader) G.leader = req; // (its leader's gone: this leads)
+      if (G?.path && G.leader !== req) {
+        Q.shift();
+        const path = this.joinPath(req);
+        if (path) this.givePath(req, path);
+        else { req.group = null; Q.push(req); } // (no way onto it near: a search of its own, after the rest)
+        continue;
       }
+      req.search ??= new PathSearch(this, (pathTable ??= new PathTable()), u.cell, req.goal, UNIT_TUNING.maxExpanded, req.climb, u.team);
+      if (!req.search.run(Math.max(paths.deadline, performance.now() + 0.5))) return; // (on with it next frame)
+      Q.shift();
+      const path = req.search.path();
+      if (G && G.leader === req) { G.path = path; G.start = req.search.start; }
+      this.givePath(req, path);
     }
-    const path = [];
-    for (let k = best; k !== startK; k = from.get(k)) path.push(unkey(k));
-    return path.reverse();
+  }
+  // u sent to goal, its path searched for in turn (see runPaths); till then it stands where it is. group: those
+  // ordered with it ({ leader, path }, see order).
+  requestPath(u, goal, group = null) {
+    const req = { u, goal, climb: this.climbs(u), group, search: null };
+    u.pathReq = req;
+    u.path = [];
+    u.repath = 0;
+    this.pathQueue.push(req);
+    return req;
+  }
+  // A searched-for path, given to its unit (a worker that can't get there builds a ladder out, see Workers.escape).
+  givePath(req, path) {
+    const u = req.u, goal = req.goal, end = path.at(-1) ?? u.cell;
+    u.pathReq = null;
+    if (u.goal !== goal) return; // (it's given up on going there)
+    u.path = path;
+    if (!path.length && (end[0] !== goal[0] || end[1] !== goal[1] || end[2] !== goal[2])) u.goal = null; // (no way at all)
+    if (req.climb) {
+      u.stuckGoal = end[0] !== goal[0] || end[1] !== goal[1] || end[2] !== goal[2] ? goal : null;
+      u.sentHere = !u.stuckGoal;
+    }
+  }
+  // A follower's way there along its group leader's path: a short search from where it is onto that path (or to
+  // where the leader set out from), along it to its end, then a short search on to its own goal. Null if it can't
+  // get onto it within UNIT_TUNING.joinSearch cells.
+  joinPath(req) {
+    const u = req.u, G = req.group, L = G.path, on = new Map();
+    on.set(key(...G.start), -1);
+    L.forEach((c, i) => on.set(key(...c), i));
+    const max = UNIT_TUNING.joinSearch, table = (searchTable ??= new PathTable());
+    const here = on.get(key(...u.cell));
+    let path, i;
+    if (here !== undefined) { path = []; i = here; } else {
+      const s = new PathSearch(this, table, u.cell, G.start, max, req.climb, u.team, on);
+      s.run(Infinity);
+      if (s.hit === null) return null;
+      path = s.path();
+      i = on.get(s.hit);
+    }
+    path.push(...L.slice(i + 1).map((c) => c.slice()));
+    const end = path.at(-1) ?? u.cell, goal = req.goal;
+    if (end[0] !== goal[0] || end[1] !== goal[1] || end[2] !== goal[2]) path.push(...this.findPath(end, goal, max, req.climb, u.team));
+    return path;
   }
 
   // Orders the selected units to a clicked point, spreading them over nearby cells so they don't all pile onto one.
@@ -1055,8 +1138,19 @@ export class Units {
     const cx = Math.floor(point[0] + normal[0] * 0.5), cz = Math.floor(point[2] + normal[2] * 0.5);
     const cy = Math.floor(point[1] + normal[1] * 0.5);
     const goals = this.formation(cx, cy, cz, sel.length, new Set(sel));
-    sel.forEach((u, i) => this.send(u, goals[i] ?? goals[0], amove, queued));
+    const group = this.groupFor(sel), sends = sel.map((u, i) => [u, goals[i] ?? goals[0]]);
+    if (group) sends.sort((a, b) => (b[0] === group.first) - (a[0] === group.first)); // (its leader first)
+    for (const [u, goal] of sends) this.send(u, goal, amove, queued, group);
     return goals;
+  }
+  // A group of units sent somewhere together (see runPaths): its leader's the one nearest the middle of them, its
+  // path searched for first (send puts it first). Null for one, or for workers (sent at once, see send).
+  groupFor(sel) {
+    const go = sel.filter((u) => !u.dying && !this.climbs(u));
+    if (go.length < 2) return null;
+    const mx = go.reduce((a, u) => a + u.pos[0], 0) / go.length, mz = go.reduce((a, u) => a + u.pos[2], 0) / go.length;
+    const first = go.reduce((a, u) => (Math.hypot(u.pos[0] - mx, u.pos[2] - mz) < Math.hypot(a.pos[0] - mx, a.pos[2] - mz) ? u : a));
+    return { first, leader: null, path: null, start: null }; // (leader: its first request, see send)
   }
 
   // n standable cells spiralling out from (x, z) at about height y, none where another villager (but those in `skip`)
@@ -1080,7 +1174,8 @@ export class Units {
   taken(cell, u) {
     for (const o of this.list) {
       if (o === u || o.dying || (u instanceof Set && u.has(o))) continue;
-      const c = o.path.length ? o.path[o.path.length - 1] : o.cell;
+      // (one waiting for its path: where it's going)
+      const c = o.pathReq && o.goal === o.pathReq.goal ? o.goal : o.path.length ? o.path[o.path.length - 1] : o.cell;
       if (c[0] === cell[0] && c[1] === cell[1] && c[2] === cell[2]) return true;
     }
     return false;
@@ -1122,19 +1217,28 @@ export class Units {
 
   // Sends u to goal (attack-moving if amove). queued: after what it's already doing (walking somewhere, or going after
   // an enemy it was told to attack), else instead of it.
-  send(u, goal, amove = false, queued = false) {
+  send(u, goal, amove = false, queued = false, group = null) {
     if (!goal) return;
     if (queued && (u.goal || u.queue.length || (u.target && u.commanded))) { u.queue.push({ cell: goal, amove }); return; }
-    this.workers.stop(u);
+    this.crew(u.team).stop(u);
     u.target = null;
     u.queue = [];
     u.patrol = null;
     u.amove = amove;
     u.goal = goal;
-    u.path = this.findPath(u.cell, goal, undefined, this.climbs(u), u.team);
+    // Any but a worker: its path's searched for over the next frames (see runPaths), its group's leader first.
+    if (!this.climbs(u)) {
+      const req = this.requestPath(u, goal, group);
+      if (group && !group.leader) group.leader = req; // (the first sent: see order)
+      u.stuckGoal = null;
+      u.sentHere = true;
+      return;
+    }
+    u.pathReq = null;
+    u.path = this.findPath(u.cell, goal, undefined, true, u.team);
     // A worker that can't get there (stuck in a pit, say): it builds a ladder out, then goes on (see Workers.escape).
     const end = u.path.at(-1) ?? u.cell;
-    u.stuckGoal = this.climbs(u) && (end[0] !== goal[0] || end[1] !== goal[1] || end[2] !== goal[2]) ? goal : null;
+    u.stuckGoal = end[0] !== goal[0] || end[1] !== goal[1] || end[2] !== goal[2] ? goal : null;
     u.sentHere = !u.stuckGoal;
   }
 
@@ -1145,13 +1249,13 @@ export class Units {
     if (!sel.length) return [];
     const cx = Math.floor(point[0] + normal[0] * 0.5), cz = Math.floor(point[2] + normal[2] * 0.5);
     const cy = Math.floor(point[1] + normal[1] * 0.5);
-    const goals = this.formation(cx, cy, cz, sel.length, new Set(sel));
+    const goals = this.formation(cx, cy, cz, sel.length, new Set(sel)), group = this.groupFor(sel);
     sel.forEach((u, i) => {
       const goal = goals[i] ?? goals[0];
       if (!goal || u.dying) return;
       if (queued && u.patrol) { u.patrol.points.push(goal); return; }
       const from = (queued && (u.queue.at(-1)?.cell ?? u.goal)) || u.cell.slice();
-      this.send(u, goal, true, queued);
+      this.send(u, goal, true, queued, group);
       u.patrol = { points: [from, goal], i: 1, d: 1 };
     });
     return goals;
@@ -1171,21 +1275,23 @@ export class Units {
     const w = u.queue.shift();
     u.amove = w.amove;
     u.goal = w.cell;
-    u.path = this.findPath(u.cell, w.cell, undefined, this.climbs(u), u.team);
+    if (this.climbs(u)) u.path = this.findPath(u.cell, w.cell, undefined, true, u.team);
+    else this.requestPath(u, w.cell); // (searched for over the next frames, see runPaths)
   }
 
   // The selected villagers the player can give orders to: all of them, or (controls set: a new game) only those of
   // that team.
   commandable() { return this.list.filter((u) => u.selected && u.kind !== 'crystal' && u.kind !== 'wall' && (!this.controls || u.team === this.controls)); }
 
-  // Stop (H): the selected units drop their orders and stand where they are.
-  stop() {
-    for (const u of this.commandable()) {
+  // Stop (H): the selected units (or sel) drop their orders and stand where they are.
+  stop(sel = this.commandable()) {
+    for (const u of sel) {
       if (u.dying) continue;
-      this.workers.stop(u);
+      this.crew(u.team).stop(u);
       u.target = null;
       u.ordered = u.commanded = false;
       u.goal = null;
+      u.pathReq = null;
       u.queue = [];
       u.patrol = null;
       u.amove = false;
@@ -1633,7 +1739,7 @@ export class Units {
       }
       if (t.role === 'mage') held.push({ parts: hatOf(t.team), head: true, chance: R.hat, kind: 'hat' });
       if (t.role === 'spearman') held.push({ parts: VALKYRIE, head: true, chance: R.wingedHelmet, kind: 'helmet' });
-      this.workers.stop(t);
+      this.crew(t.team).stop(t);
       t.dying = 1e-4;
       // Its limbs start as they were last drawn (see posture), swinging, striking or drawing a bow.
       const pose = t.pose ?? { angles: [0, 0, 0, 0], rolls: [0, 0, 0, 0] };
@@ -1786,7 +1892,12 @@ export class Units {
       else u.restSince ??= this.time;
       if (u.target && !u.dying) this.attackers.set(u.target, (this.attackers.get(u.target) ?? 0) + 1);
     }
-    this.workers.update(dt);
+    // Every team's workers, sharing this frame's path searches (a different team first each frame, so one team's
+    // workers can't use them all up every time).
+    const paths = { deadline: performance.now() + WORK_TUNING.pathMs, n: 0 }, crews = [...this.crews.values()];
+    this.crewTurn = ((this.crewTurn ?? 0) + 1) % crews.length;
+    for (let i = 0; i < crews.length; i++) crews[(this.crewTurn + i) % crews.length].update(dt, paths);
+    this.runPaths({ deadline: performance.now() + T.orderPathMs, n: 0 }); // (units sent somewhere: their own share)
     for (const u of this.list) {
       u.hurt = Math.max(0, u.hurt - dt);
       u.wincing = Math.max(0, u.wincing - dt);
@@ -1840,7 +1951,10 @@ export class Units {
           this.drown(u, dt);
         }
       }
-      if (u.repath > 0 && (u.repath -= dt) <= 0 && u.goal) u.path = this.findPath(u.cell, u.goal, undefined, this.climbs(u), u.team);
+      if (u.repath > 0 && (u.repath -= dt) <= 0 && u.goal) {
+        if (this.climbs(u)) u.path = this.findPath(u.cell, u.goal, undefined, true, u.team);
+        else this.requestPath(u, u.goal);
+      }
 
       let walking = false;
       const speed = T[`${u.kind}Speed`] ?? 3.2;
@@ -2181,7 +2295,8 @@ export class Units {
 
   // Boxes to draw: per part a model matrix (column-major), a colour and whether it glows (emit). `torch` (0-1) is how
   // lit the torches are; each lit torch's flame goes in this.torches as [x, y, z, brightness 0-1].
-  parts(torch = 0) {
+  // view: { viewProj, height (pixels) } to pose only what's on screen (see POSE_TUNING), or null for everything.
+  parts(torch = 0, view = null) {
     const out = [];
     this.torches = [];
     this.sweeps = [];
@@ -2191,9 +2306,24 @@ export class Units {
     // The possessed unit (main.js looks out from its eyes): its head's place and way, and its head (or, hideBody, all
     // of it) left out so it's not in the way.
     this.eyeFrame = null;
+    this.frameNo = (this.frameNo ?? 0) + 1;
+    const planes = view && frustumPlanes(view.viewProj);
     for (const u of this.list) {
       if (u.hidden || u.kind === 'crystal' || u.kind === 'wall') continue; // (where the player can't see it, see fog.js; crystals.js draws crystals; a wall's terrain)
-      const first = out.length;
+      // Off screen: not posed. Small on screen: posed every other frame (see POSE_TUNING).
+      if (planes && u !== this.possessed) {
+        const at = u.rag ? u.rag.pos : u.pos, tall = onScreen(planes, view, at[0], at[1] + 1, at[2]);
+        if (tall < 0) { u.cached = null; continue; }
+        const c = u.cached;
+        if (tall < POSE_TUNING.halfBelow && c?.frame === this.frameNo - 1 && u.role !== 'priest') {
+          for (const p of c.parts) out.push(p);
+          for (const t of c.torches) this.torches.push(t);
+          for (const w of c.sweeps) this.sweeps.push(w);
+          c.frame = -1; // (posed again next frame)
+          continue;
+        }
+      }
+      const first = out.length, torchesAt = this.torches.length, sweepsAt = this.sweeps.length;
       const ground = this.drawHeight(u), feet = ground + mountLift(u); // (a rider's up in its saddle)
       // How it stands this frame: its limbs, upper body and head, and what's in its hands (see posture).
       const P = this.posture(u, torch), bob = P.bob, look = P.look;
@@ -2472,11 +2602,13 @@ export class Units {
         if (!rag) for (let i = armsAt; i < armsEnd; i++) for (let j = 0; j < 3; j++) out[i].m[12 + j] += off[j];
         if (this.hideBody) { out.splice(first); ankhs.delete(u); } else out.splice(headAt, headEnd - headAt);
       }
+      // (as it is this frame, for the next if it's small on screen)
+      if (planes) u.cached = { parts: out.slice(first), torches: this.torches.slice(torchesAt), sweeps: this.sweeps.slice(sweepsAt), frame: this.frameNo };
     }
     this.ladders.parts(out, this.hiddenAt);
     this.walls?.parts(out, this.hiddenAt, this.time); // (walls' banners)
     // Piles of what workers have left on the ground (see jobs.js Workers.drop), up to 40 items shown each.
-    for (const pl of this.workers.piles) {
+    for (const pl of [...this.crews.values()].flatMap((c) => c.piles)) {
       if (this.hiddenAt?.(pl.x + 0.5, pl.z + 0.5)) continue;
       for (const [c, s, col] of loadBoxes(pl.block, Math.min(pl.n, 40), true)) {
         out.push({ m: [s[0], 0, 0, 0, 0, s[1], 0, 0, 0, 0, s[2], 0, pl.x + 0.5 + c[0], pl.y + c[1], pl.z + 0.5 + c[2], 1], col, emit: 0 });
@@ -2737,6 +2869,7 @@ function strand(a, b, w, col) {
 class MinHeap {
   constructor() { this.f = []; this.k = []; }
   get size() { return this.f.length; }
+  clear() { this.f.length = 0; this.k.length = 0; }
   push(f, k) {
     const F = this.f, K = this.k;
     let i = F.length;
@@ -2767,4 +2900,133 @@ class MinHeap {
     }
     return top;
   }
+}
+
+// An A* search (see findPath) from start to goal, run in one go or a little at a time (run, till a deadline), in a
+// PathTable it has to itself while it's running. maxExpanded: cells it may take from the open list before it gives
+// up and goes as near as it got. onPath: a Map of cell keys: reaching any of them ends it there (hit, see joinPath).
+class PathSearch {
+  constructor(units, table, start, goal, maxExpanded, climb, team, onPath = null) {
+    this.units = units;
+    this.table = table;
+    this.start = start.slice();
+    this.goal = goal;
+    this.max = maxExpanded;
+    this.climb = climb;
+    this.team = team;
+    this.onPath = onPath;
+    this.startK = key(...start);
+    this.goalK = key(...goal);
+    this.heap = new MinHeap();
+    this.expanded = 0;
+    this.hit = null;
+    this.done = false;
+    this.gen = -1; // (the table's search this is: another search since, and it starts again)
+  }
+  h(x, y, z) {
+    const [gx, gy, gz] = this.goal, dx = Math.abs(x - gx), dz = Math.abs(z - gz);
+    return Math.max(dx, dz) + (Math.SQRT2 - 1) * Math.min(dx, dz) + Math.abs(y - gy) * 0.5;
+  }
+  // Searches on till it's done (true) or it's past deadline (performance.now(); false: there's more).
+  run(deadline) {
+    const T = this.table, out = STEPS, units = this.units, heap = this.heap, onPath = this.onPath;
+    if (this.done) return true;
+    if (this.gen !== T.gen || T.owner !== this) { // (a fresh start, or the table was used by another meanwhile)
+      T.reset();
+      T.owner = this;
+      this.gen = T.gen;
+      heap.clear();
+      this.expanded = 0;
+      T.open(this.startK, 0, -1);
+      this.best = this.startK;
+      this.bestH = this.h(...this.start);
+      heap.push(this.bestH, this.startK);
+    }
+    while (heap.size && this.expanded < this.max && !T.full) {
+      if ((this.expanded & 255) === 255 && performance.now() > deadline) return false;
+      const k = heap.pop(), s = T.slot(k);
+      if (T.closed[s]) continue;
+      T.closed[s] = 1;
+      this.expanded++;
+      if (k === this.goalK) { this.best = k; break; }
+      if (onPath && k !== this.startK && onPath.has(k)) { this.best = k; this.hit = k; break; }
+      const x = k % X, z = Math.floor(k / X) % Z, y = Math.floor(k / (X * Z));
+      const hk = this.h(x, y, z);
+      if (hk < this.bestH) { this.bestH = hk; this.best = k; }
+      const gk = T.g[s], n = units.expand(x, y, z, this.climb, this.team);
+      for (let i = 0; i < n; i++) {
+        const nx = out[i * 4], ny = out[i * 4 + 1], nz = out[i * 4 + 2], nk = nx + X * (nz + Z * ny);
+        const ns = T.slot(nk), ng = gk + out[i * 4 + 3];
+        if (ns >= 0 && (T.closed[ns] || ng >= T.g[ns])) continue;
+        T.open(nk, ng, k);
+        heap.push(ng + this.h(nx, ny, nz), nk);
+      }
+    }
+    this.finish();
+    return true;
+  }
+  // Done: the way back from the best cell so far to the start, while the table still has it.
+  finish() {
+    const T = this.table, path = [];
+    for (let k = this.best; k !== this.startK; k = T.from[T.slot(k)]) path.push(unkey(k));
+    this.cells = path.reverse();
+    this.done = true;
+    T.owner = null;
+  }
+  // The cells after the start, to the goal or as near as it got (once it's done).
+  path() { return this.cells; }
+}
+
+// A path search's cells (findPath): an open-addressed hash table of cell keys, each slot with the cell's cost so far
+// (g), the cell it was reached from and whether it's done (closed). A slot's only taken for the search that stamped it
+// (gen), so a new search starts with reset() and nothing cleared. Past FULL of its slots taken, the search stops where
+// it's got to (it's looked at enough).
+class PathTable {
+  constructor(bits = 20) {
+    const n = 1 << bits;
+    this.mask = n - 1;
+    this.keys = new Int32Array(n);
+    this.g = new Float64Array(n);
+    this.from = new Int32Array(n);
+    this.closed = new Uint8Array(n);
+    this.stamp = new Uint32Array(n);
+    this.gen = 0;
+    this.owner = null; // the search using it
+    this.used = 0;
+    this.limit = Math.floor(n * 0.6);
+  }
+  get full() { return this.used >= this.limit; }
+  reset() {
+    this.used = 0;
+    if (++this.gen === 0xffffffff) { this.stamp.fill(0); this.gen = 1; }
+  }
+  // The slot holding cell k this search, or -1.
+  slot(k) {
+    for (let i = Math.imul(k, 0x9e3779b1) >>> 0 & this.mask; ; i = (i + 1) & this.mask) {
+      if (this.stamp[i] !== this.gen) return -1;
+      if (this.keys[i] === k) return i;
+    }
+  }
+  // Cell k reached at cost g from cell `from` (-1: the start), not done yet.
+  open(k, g, from) {
+    let i = Math.imul(k, 0x9e3779b1) >>> 0 & this.mask;
+    while (this.stamp[i] === this.gen && this.keys[i] !== k) i = (i + 1) & this.mask;
+    if (this.stamp[i] !== this.gen) { this.stamp[i] = this.gen; this.keys[i] = k; this.closed[i] = 0; this.used++; }
+    this.g[i] = g;
+    this.from[i] = from;
+  }
+}
+
+// The view's six planes (inward, normalised [a, b, c, d]) from its view-projection matrix (column-major, depth 0 to 1).
+function frustumPlanes(m) {
+  const row = (i) => [m[i], m[4 + i], m[8 + i], m[12 + i]], r0 = row(0), r1 = row(1), r2 = row(2), r3 = row(3);
+  return [r3.map((v, i) => v + r0[i]), r3.map((v, i) => v - r0[i]), r3.map((v, i) => v + r1[i]), r3.map((v, i) => v - r1[i]), r2, r3.map((v, i) => v - r2[i])]
+    .map((p) => { const l = Math.hypot(p[0], p[1], p[2]) || 1; return p.map((v) => v / l); });
+}
+// How tall (pixels) 2 voxels at (x, y, z) are drawn, or -1 when a ball of POSE_TUNING.cullRadius there is off screen.
+function onScreen(planes, view, x, y, z) {
+  const r = POSE_TUNING.cullRadius;
+  for (const p of planes) if (p[0] * x + p[1] * y + p[2] * z + p[3] < -r) return -1;
+  const m = view.viewProj, w = m[3] * x + m[7] * y + m[11] * z + m[15];
+  return Math.abs(m[5] * 2) / Math.max(1e-6, Math.abs(w)) * view.height / 2;
 }

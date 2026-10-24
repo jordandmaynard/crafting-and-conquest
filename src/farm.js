@@ -4,8 +4,9 @@
 // turning gold; ripe, it waits for an idle worker within the job range to reap it (with a sickle): the yield goes into
 // a new game's inventory (wheat, listed over iron and gold) and the farm's sown again, growing from the start.
 //
-// The farms are one shared open order (FarmJob), like Mine's: its columns are the marks still to till and the ripe
-// wheat, checked a few times a second (Farms.update), which adds it back to the open jobs whenever there's work in it.
+// Each farm is its team's (the team that marked it). Each team's farms are one shared open order of its (a FarmJob, on
+// its Workers), like Mine's: its columns are the marks still to till and the ripe wheat, checked a few times a second
+// (Farms.update), which adds it back to the team's open jobs whenever there's work in it.
 // Delete clears farms under the brush, tilled ones going back to grass. A farm that's dug out goes; one built over
 // stops growing (and isn't drawn) till it's open to the sky again.
 //
@@ -238,11 +239,11 @@ export class Farms {
     this.device = device;
     this.terrain = terrain;
     this.sky = sky;
-    this.list = new Map(); // column (x + X * z) -> { x, y (its ground voxel), z, tilled, sown (clock), covered, open }
+    this.list = new Map(); // column (x + X * z) -> { x, y (its ground voxel), z, team, tilled, sown (clock), covered, open }
     this.clock = 0;
     this.wait = 0;
-    this.job = new FarmJob(this);
-    this.inventory = null; // a new game's (inventory.js): reaped wheat goes into it; sandbox has none
+    this.jobs = new Map(); // team -> its FarmJob
+    this.crews = null;     // team -> its Workers (Units.crews): reaped wheat goes to a new game's inventory on them
     this.onEdit = null;    // (lo, hi): tilling or clearing a farm changed the voxel box [lo, hi)
     this.dirty = true;     // the wheat to draw has changed
     this.count = 0;        // farms drawn
@@ -296,24 +297,32 @@ export class Farms {
   }
 
   // Marks voxels ([x, y, z], farmable) to be tilled. insta: tilled at once (insta-build).
-  mark(cells, insta = false) {
+  // A team's FarmJob.
+  job(team) {
+    let j = this.jobs.get(team);
+    if (!j) this.jobs.set(team, j = new FarmJob(this, team));
+    return j;
+  }
+
+  mark(cells, team, insta = false) {
     for (const [x, y, z] of cells) {
       const k = x + X * z;
       if (this.list.has(k) || !this.farmable(x, y, z)) continue;
-      this.list.set(k, { x, y, z, tilled: false, sown: this.clock, covered: false, open: 0 });
-      this.job.grow(x, z);
+      this.list.set(k, { x, y, z, team, tilled: false, sown: this.clock, covered: false, open: 0 });
+      this.job(team).grow(x, z);
       if (insta) this.till(k);
     }
     this.wait = 0; // (its work goes up next update)
   }
 
   // Clears the farms in columns [x0, x1) × [z0, z1) (Delete, under the brush): tilled ones go back to grass.
-  unmark(x0, z0, x1, z1) {
+  // Clears team's farms in the box (team null: anyone's).
+  unmark(x0, z0, x1, z1, team = null) {
     const t = this.terrain;
     for (let z = z0; z < z1; z++) {
       for (let x = x0; x < x1; x++) {
         const k = x + X * z, f = this.list.get(k);
-        if (!f) continue;
+        if (!f || (team && f.team !== team)) continue;
         this.list.delete(k);
         if (f.tilled && t.block(f.x, f.y, f.z) === BLOCK.FARM) {
           const c = t.setVoxel(f.x, f.y, f.z, BLOCK.GROUND);
@@ -325,7 +334,11 @@ export class Farms {
     this.wait = 0;
   }
 
-  has(x, z) { return this.list.has(x + X * z); }
+  // Whether there's a farm at column (x, z) (team's, if it's given).
+  has(x, z, team = null) {
+    const f = this.list.get(x + X * z);
+    return !!f && (!team || f.team === team);
+  }
 
   // A worker's hoe: the ground's tilled, and wheat's sown in it.
   till(k) {
@@ -346,22 +359,23 @@ export class Farms {
   reap(k, u = null) {
     const f = this.list.get(k);
     if (!f || !this.ripe(f)) return;
-    const n = Math.max(0, Math.round(FARM_TUNING.yield));
-    if (this.inventory && u && this.workers) this.workers.take(u, WHEAT, n, [f.x, f.y + 1, f.z]);
-    else this.inventory?.add(WHEAT, n);
+    const n = Math.max(0, Math.round(FARM_TUNING.yield)), crew = this.crews?.get(f.team);
+    if (crew?.inventory && u) crew.take(u, WHEAT, n, [f.x, f.y + 1, f.z]);
+    else crew?.inventory?.add(WHEAT, n);
     f.sown = this.clock;
     this.dirty = true;
   }
 
   // Per frame: the clock on, and a few times a second each farm checked (dug out: gone; built over: not growing) and
   // the open order's work (marks to till, ripe wheat) handed to the workers.
-  update(dt, workers) {
-    this.workers = workers;
+  // crews: team -> its Workers (Units.crews), whose open jobs each team's FarmJob goes on.
+  update(dt, crews) {
+    this.crews = crews;
     this.clock += dt;
     this.wait -= dt;
     if (this.wait > 0) return;
     this.wait = 0.25;
-    const t = this.terrain, pending = [];
+    const t = this.terrain, pending = new Map();
     for (const [k, f] of this.list) {
       const b = t.block(f.x, f.y, f.z);
       if (f.tilled ? b !== BLOCK.FARM : !this.farmable(f.x, f.y, f.z)) { this.list.delete(k); this.dirty = true; continue; }
@@ -370,10 +384,13 @@ export class Farms {
       if (covered) f.sown = this.clock; // (nothing grows under a block)
       const open = this.openSides(f);
       if (open !== f.open) { f.open = open; this.dirty = true; }
-      if (!f.tilled || this.ripe(f)) pending.push(k);
+      if (!f.tilled || this.ripe(f)) { if (!pending.has(f.team)) pending.set(f.team, []); pending.get(f.team).push(k); }
     }
-    this.job.pending = pending;
-    if (pending.length && !workers.jobs.includes(this.job)) workers.add(this.job);
+    for (const [team, job] of this.jobs) {
+      job.pending = pending.get(team) ?? [];
+      const crew = crews.get(team);
+      if (crew && job.pending.length && !crew.jobs.includes(job)) crew.add(job);
+    }
   }
 
   // The sides of a farm's voxel with nothing solid beside it (bits: -x, +x, -z, +z): there the ground's top edge is
@@ -385,8 +402,9 @@ export class Farms {
   }
 
   // Ghost markers (see the unit renderer's vsGhost) for the farms still to till: [x, y, z, 8].
-  ghosts(out = []) {
-    for (const f of this.list.values()) if (!f.tilled) out.push([f.x, f.y, f.z, 8]);
+  // Team's marks still to till, as ghost cubes.
+  ghosts(out = [], team = null) {
+    for (const f of this.list.values()) if (!f.tilled && (!team || f.team === team)) out.push([f.x, f.y, f.z, 8]);
     return out;
   }
 
@@ -446,12 +464,13 @@ export class Farms {
   }
 }
 
-// The farms as one open order, shared like Mine's: its columns are those with a mark to till or ripe wheat (Farms.update
-// sets them); an idle worker within the job range takes the nearest. Tilling and reaping aren't blocks placed, so
+// A team's farms as one open order, shared like Mine's: its columns are those with a mark to till or ripe wheat
+// (Farms.update sets them); an idle worker of the team takes the nearest. Tilling and reaping aren't blocks placed, so
 // they're done by the task's onPlace, with the task's own time and tool.
 export class FarmJob {
-  constructor(farms) {
+  constructor(farms, team) {
     this.farms = farms;
+    this.team = team;
     this.pending = [];
     this.claimed = new Map();
     this.skipUntil = new Map();
@@ -465,11 +484,11 @@ export class FarmJob {
     this.z0 = Math.min(this.z0, z); this.z1 = Math.max(this.z1, z + 1);
   }
 
-  contains(x, z) { return this.farms.has(x, z); }
+  contains(x, z) { return this.farms.has(x, z, this.team); }
 
   task(x, z) {
     const farms = this.farms, k = x + X * z, f = farms.list.get(k), F = FARM_TUNING;
-    if (!f) return null;
+    if (!f || f.team !== this.team) return null;
     if (!f.tilled) {
       if (!farms.farmable(f.x, f.y, f.z)) return null;
       return { x, y: f.y, z, dig: false, top: f.y, ...FARM_REACH, time: F.tillTime, tool: 'hoe', onPlace: () => farms.till(k) };

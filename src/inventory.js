@@ -1,7 +1,7 @@
-// The team's inventory in a new game (sandbox has none: every block is free there). Each block blue's workers mine
-// goes into it once they've carried it to the Keep (see jobs.js CARRY_TUNING) (stone as bricks, logs as planks and dirt as clay bricks, INVENTORY_TUNING; clay, bricks and planks as
-// themselves), and
-// each block they place comes out of it. A worker won't take on placing a block the inventory hasn't got (counting
+// A team's inventory in a new game (sandbox has none: every block is free there); each team has its own, on its
+// Workers. Each block its workers mine goes into it once they've carried it to the Keep (see jobs.js CARRY_TUNING)
+// (stone as bricks, logs as planks and dirt as clay bricks, INVENTORY_TUNING; clay, bricks and planks as themselves),
+// and each block they place comes out of it. A worker won't take on placing a block the inventory hasn't got (counting
 // what the others are already on their way to place), so it digs elsewhere until there is some.
 //
 // Every few frames the inventory is shared out over the open orders, oldest first, counting what each order will dig
@@ -81,6 +81,7 @@ export class Inventory {
     let have = this.get(b);
     for (const o of this.workers.units.list) {
       const t = o.task;
+      if (o.team !== this.workers.team) continue;
       if (o !== u && t && !t.dig && !t.onPlace && built(t.place ?? BLOCK.GROUND) === b) have--;
     }
     return have > 0;

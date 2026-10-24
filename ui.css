@@ -357,6 +357,14 @@ body.in-menu #toast { top: 24px; }
 #menu .face .bn small { font: 900 12px/1.2 var(--body); }
 #menu .face .rm { position: absolute; right: 6px; top: 8px; z-index: 3; display: flex; align-items: center; justify-content: center; width: 34px; height: 34px; padding: 0; border-width: 3px; }
 #menu .face .roll { width: 140px; height: 42px; border-radius: 21px; margin-top: 14px; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 6px; padding: 0; color: var(--fg); }
+#menu .face .colours { display: flex; gap: 6px; }
+#menu .face .colours button { display: flex; align-items: center; justify-content: center; width: 30px; height: 30px; padding: 0; box-sizing: border-box; border: 3px solid var(--ink); border-radius: 50%; background: var(--c); color: var(--fg); box-shadow: 0 3px 0 rgba(0, 0, 0, 0.3); cursor: pointer; }
+#menu .face .colours button .emb { fill: currentColor; }
+#menu .face .colours button[aria-pressed="true"] { box-shadow: 0 0 0 3px var(--brass), 0 0 0 6px var(--ink); transform: translateY(1px); }
+#menu .face .colours button:hover:not([aria-pressed="true"]) { filter: brightness(1.12); }
+#menu .face .level { display: flex; align-items: center; gap: 4px; }
+#menu .face .level .btn { display: flex; align-items: center; justify-content: center; width: 30px; height: 30px; padding: 0; border-width: 3px; }
+#menu .face .level .h-disp { width: 76px; text-align: center; font-size: 17px; color: var(--ink); }
 #menu .face .hint { font: 900 13px/1.2 var(--body); color: var(--ink-2); }
 #menu .setup-grid { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); gap: 28px; }
 #menu .slider { display: grid; grid-template-columns: 104px 1fr 54px; align-items: center; gap: 12px; margin-bottom: 12px; font: 900 15px/1.2 var(--body); }

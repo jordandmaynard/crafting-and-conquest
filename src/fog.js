@@ -256,12 +256,12 @@ export class Fog {
     this.onRows?.(0, SIZE[2]);
   }
 
-  // Whether the player can't see column (x, z) now.
-  hidden(x, z) {
+  // Whether the player (or another team) can't see column (x, z) now.
+  hidden(x, z, team = this.player) {
     if (!this.on) return false;
     const xi = Math.floor(x), zi = Math.floor(z);
     if (xi < 0 || zi < 0 || xi >= SIZE[0] || zi >= SIZE[2]) return true;
-    return this.team(this.player).state[xi + zi * SIZE[0]] !== VISIBLE;
+    return this.team(team).state[xi + zi * SIZE[0]] !== VISIBLE;
   }
 
   // The player's state of each column (null while it's off).
@@ -349,12 +349,43 @@ export class Fog {
     return this.near[xi + zi * SIZE[0]] === 0;
   }
 
-  // Whether the player's never seen column (x, z) (false while it's off).
-  never(x, z) {
+  // Whether the player (or team) has never seen column (x, z) (false while it's off).
+  never(x, z, team = this.player) {
     if (!this.on) return false;
     const xi = Math.floor(x), zi = Math.floor(z);
     if (xi < 0 || zi < 0 || xi >= SIZE[0] || zi >= SIZE[2]) return true;
-    return this.team(this.player).state[xi + zi * SIZE[0]] === NEVER;
+    return this.team(team).state[xi + zi * SIZE[0]] === NEVER;
+  }
+
+  // The view switched to another team's (a test key, see main.js): its fog from now on. Every held-back edit is shown
+  // first (returned as boxes, as flush), and what's near what it's seen worked out again; everything goes up again.
+  setPlayer(team) {
+    if (team === this.player) return [];
+    const out = this.flush(true), [X, , Z] = SIZE;
+    this.player = team;
+    if (!this.on) return out;
+    const st = this.team(team).state, M = Math.ceil(Math.max(0.5, FOG_TUNING.edge)) + 2;
+    this.unseen = 0;
+    for (let i = 0; i < st.length; i++) if (st[i] === NEVER) this.unseen++;
+    // Near: within M of a column it's seen (rows, then columns, of a square that size).
+    const rows = new Uint8Array(X * Z);
+    for (let z = 0; z < Z; z++) {
+      let last = -Infinity;
+      for (let x = 0; x < X; x++) if (st[x + z * X] !== NEVER) last = x; else if (x - last <= M) rows[x + z * X] = 1;
+      last = Infinity;
+      for (let x = X - 1; x >= 0; x--) if (st[x + z * X] !== NEVER) { last = x; rows[x + z * X] = 1; } else if (last - x <= M) rows[x + z * X] = 1;
+    }
+    this.near.fill(0);
+    for (let x = 0; x < X; x++) {
+      let last = -Infinity;
+      for (let z = 0; z < Z; z++) if (rows[x + z * X]) { last = z; this.near[x + z * X] = 1; } else if (z - last <= M) this.near[x + z * X] = 1;
+      last = Infinity;
+      for (let z = Z - 1; z >= 0; z--) if (rows[x + z * X]) last = z; else if (last - z <= M) this.near[x + z * X] = 1;
+    }
+    this.revealed.clear();
+    this.rows = [0, Z];
+    this.onRows?.(0, Z);
+    return out;
   }
 
   // Each column's share (0-1) of FOG_TUNING.dither its sight edge comes in by: a hash (speckled) mixed with value

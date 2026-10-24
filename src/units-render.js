@@ -29,7 +29,7 @@ export const UNITS_WGSL = /* wgsl */ `
 // xyz and w = brightness (0 for an unused slot); eye: xyz, w = 1 for orthographic; ahead: the way the camera looks, w =
 // a pixel's world size at unit distance (or anywhere, orthographic); toon (TOON_TUNING): x = on, y = bands, z = band
 // softness, w = outline width (pixels); outline: rgb = its colour (linear), w = marked digs' opacity behind the
-// ground (GHOST_TUNING.xray); selBlue, selRed, selYellow, selPurple: the teams' colours (selBlue tints the ghosts the
+// ground (GHOST_TUNING.xray); selBlue, selRed, selYellow, selPurple: the teams' colours (selBlue's slot holds the player's team's, which tints the ghosts the
 // player could build, see vsGhost; the selected's outline is a pass of its own, see SELECT_OUTLINE_WGSL); metal (parts with emit 3 and up, see
 // metalColour): reflection strength, glints, glint speed, time (s); metalEnv: x = 1 with a reflection cube (oreEnv,
 // see setEnv), y = its brightness, z = the sun's highlight, w = its sharpness; glows: coloured lights, pairs of (xyz, reach; 0
@@ -290,7 +290,7 @@ fn vsGhost(@location(0) corner: vec3f, @location(1) normal: vec3f, @location(2) 
   if (g.w == 4.0) { col = vec3f(1.5, 1.1, 0.3); }
   if (g.w == 6.0 || g.w == 7.0 || g.w == 12.0) { col = vec3f(1.1, 1.18, 1.35); alpha = select(0.32, 0.45, preview); }
   let team = g.w == 8.0 || g.w == 9.0 || g.w == 11.0 || g.w == 13.0 || g.w == 14.0 || g.w == 16.0;
-  if (team) { col = V.selBlue.rgb * 1.25; alpha = select(0.32, 0.45, preview); } // (the player's team: blue)
+  if (team) { col = V.selBlue.rgb * 1.25; alpha = select(0.32, 0.45, preview); } // (the player's team's colour)
   if (torch) { alpha = 0.6; }
   o.col = vec4f(col * lit, alpha);
   o.xray = select(0.0, 1.0, g.w == 0.0 || g.w == 2.0); // (a dig, marked or previewed: seen through the ground too)
@@ -457,6 +457,7 @@ export class UnitRenderer {
   constructor(device, format, depthFormat, sky) {
     this.device = device;
     this.sky = sky;
+    this.player = 'blue'; // the team played from this screen (its ghosts are tinted its colour: selBlue's slot)
     const module = device.createShaderModule({ label: 'units', code: UNITS_WGSL });
     const viewLayout = device.createBindGroupLayout({
       label: 'units view',
@@ -668,7 +669,8 @@ export class UnitRenderer {
     if (cam) u.set([...cam.eye, cam.ortho ? 1 : 0, ...cam.ahead, cam.pixel], base);
     u.set([toon ? 1 : 0, Math.max(1, Math.round(T.bands)), T.softness, T.unitOutline, ...linearColor(T.unitColor), GHOST_TUNING.xray], base + 8);
     const HB = HEALTHBAR_TUNING;
-    u.set([...linearColor(HB.hotBlue), SELECT_TUNING.outline, ...linearColor(HB.hotRed), 0], base + 16);
+    const hotPlayer = HB[`hot${this.player[0].toUpperCase()}${this.player.slice(1)}`] ?? HB.hotBlue;
+    u.set([...linearColor(hotPlayer), SELECT_TUNING.outline, ...linearColor(HB.hotRed), 0], base + 16);
     u.set([...linearColor(HB.hotYellow), 0, ...linearColor(HB.hotPurple), 0], base + 24);
     u.set(cam?.metal ?? [0, 0, 0, 0], base + 32);
     u.set(cam?.metalEnv ?? [0, 0, 0, 0], base + 36);
